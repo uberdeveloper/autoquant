@@ -89,7 +89,7 @@ validation:
     - shuffled_signal
   min_trades: 30                       # below this, decline to conclude
   multiple_testing:
-    n_tested_so_far: null              # filled by runner from the leaderboard
+    n_tested_so_far: null              # filled by backtest.py from the leaderboard
     method: deflated_sharpe
 
 verdict:

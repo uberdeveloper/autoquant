@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stages [6][7][8] — one harness for every harvested idea.
 
-    python3 runner.py specs/example-200dma-timing.yaml
+    python3 backtest.py specs/example-200dma-timing.yaml
 
 Loads a spec, imports strategies/<slug>.py, runs the backtest and the adversarial
 suite (IS/OOS split at the publication date, cost sweep, parameter neighbourhood,
