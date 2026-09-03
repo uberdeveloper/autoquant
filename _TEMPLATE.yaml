@@ -1,0 +1,99 @@
+# STRATEGY SPEC — the contract between an article and a backtest.
+#
+# Filled in at pipeline stage [4] (EXTRACT), by hand or by LLM, from ONE article.
+# Rules:
+#   - Every field below is required. Unknown -> write `null` and log it under
+#     `ambiguities`. Never guess silently.
+#   - Nothing here may depend on information unavailable at the decision time.
+#   - If you cannot express entry/exit as a deterministic function of past data,
+#     the article is UNTESTABLE. Say so and stop; do not invent the missing rule.
+
+meta:
+  slug: example-200dma-timing          # matches filename and strategies/<slug>.py
+  title: "The article's exact title"
+  url: https://example.com/post
+  source: "Source Blog"
+  posted: 2026-08-09                   # publication date -> the OOS boundary
+  claim: >                             # ONE sentence, the falsifiable claim
+    Holding SPY only when it is above its 200-day moving average beats
+    buy-and-hold on risk-adjusted return.
+  author_evidence:                     # what the article itself reports
+    sample: "1950-2024, SPY/S&P 500 total return"
+    headline_metrics: {cagr: 0.098, sharpe: 0.72, max_dd: -0.28}
+    costs_included: false              # usually false — note it, it matters
+
+data:
+  universe: [SPY]                      # explicit tickers, or a rule + point-in-time source
+  bar: 1d                              # 1d | 1h | 5m | ...
+  fields: [open, high, low, close, volume]
+  start: 1993-01-29
+  end: null                            # null = today
+  source: yfinance                     # note survivorship/adjustment caveats here
+  caveats:
+    - "yfinance prices are split/dividend adjusted; the article may use price-only."
+    - "No point-in-time universe — delisted names absent (survivorship bias)."
+
+signal:
+  # Deterministic, vectorised description. Pseudocode is fine; it becomes
+  # strategies/<slug>.py::signal(df) -> pd.Series
+  definition: "sma200 = close.rolling(200).mean(); raw = close > sma200"
+  lookback_bars: 200                   # bars to warm up before the first live signal
+  lag_bars: 1                          # decision on bar t executes on bar t+1. NEVER 0.
+
+rules:
+  entry: "raw becomes True"
+  exit: "raw becomes False"
+  direction: long_only                 # long_only | short_only | long_short
+  position_when_flat: cash             # cash | short | alternative_asset (name it)
+  sizing: full_notional                # full_notional | vol_target | fixed_fraction
+  vol_target: null                     # e.g. 0.10 annualised, if sizing == vol_target
+  max_leverage: 1.0
+  rebalance: on_signal_change          # on_signal_change | daily | weekly | monthly
+  execution_price: next_open           # next_open | same_close (state which and why)
+
+costs:
+  # Not optional. A spec with zero costs is auto-FAILED at stage [7].
+  commission_bps: 1.0                  # per side, on traded notional
+  slippage_bps: 5.0                    # per side
+  borrow_bps_annual: 0.0               # shorts only
+  financing_bps_annual: 0.0            # leverage only
+
+ambiguities:
+  # The point of the whole spec. One entry per thing the article left open.
+  # `default` is what the backtest does; `alternatives` get swept at stage [7].
+  - id: execution_timing
+    question: "Signal computed on the close — can you trade that same close?"
+    default: next_open
+    alternatives: [same_close]
+    material: true                     # true = plausibly flips the verdict
+  - id: ma_type
+    question: "Simple or exponential 200-day average?"
+    default: simple
+    alternatives: [exponential]
+    material: false
+  - id: flat_asset
+    question: "Cash at 0%, or T-bills, when out of the market?"
+    default: cash_zero
+    alternatives: [tbill_3m]
+    material: true
+
+validation:
+  # Which adversarial tests must this idea survive to be called REPLICATED.
+  oos_start: 2026-08-09                # = meta.posted; genuinely unseen by the author
+  is_oos_split: publication_date       # publication_date | fixed_fraction | none
+  param_sweep:                         # robustness neighbourhood, not optimisation
+    lookback_bars: [100, 150, 200, 250, 300]
+  cost_sweep_bps: [0, 5, 10, 20, 50]   # where does the edge die?
+  null_tests:
+    - random_entry_matched_exposure    # same time-in-market, random timing, 1000 draws
+    - shuffled_signal
+  min_trades: 30                       # below this, decline to conclude
+  multiple_testing:
+    n_tested_so_far: null              # filled by runner from the leaderboard
+    method: deflated_sharpe
+
+verdict:
+  # Filled in at stage [8]. Default is FAILED — the claim must earn its upgrade.
+  status: PENDING     # REPLICATED | WEAKER | FAILED | UNTESTABLE
+  reason: null
+  report: reports/example-200dma-timing.md
