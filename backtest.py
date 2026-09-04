@@ -136,12 +136,17 @@ def random_entry_null(res: pd.DataFrame, spec: dict, n: int = 500, seed: int = 0
         return {"note": "degenerate exposure — null test not meaningful"}
     ret = res["asset_ret"].to_numpy()
     per_side = (spec["costs"].get("commission_bps", 0) + spec["costs"].get("slippage_bps", 0)) / 1e4
-    sharpes = np.empty(n)
-    for i in range(n):
-        pos = np.zeros(n_bars)
-        pos[rng.choice(n_bars, k, replace=False)] = 1.0
-        net = pos * ret - np.abs(np.diff(pos, prepend=0.0)) * per_side
-        sharpes[i] = net.mean() / net.std() * np.sqrt(TRADING_DAYS) if net.std() > 0 else 0.0
+
+    # All trials at once: a (n, n_bars) 0/1 position matrix. argsort of a random
+    # matrix gives k distinct bar indices per row, matching rng.choice(replace=False).
+    pos = np.zeros((n, n_bars))
+    chosen = np.argsort(rng.random((n, n_bars)), axis=1)[:, :k]
+    np.put_along_axis(pos, chosen, 1.0, axis=1)
+
+    net = pos * ret - np.abs(np.diff(pos, axis=1, prepend=0.0)) * per_side
+    std = net.std(axis=1)
+    sharpes = np.where(std > 0, net.mean(axis=1) / np.where(std > 0, std, 1.0) * np.sqrt(TRADING_DAYS), 0.0)
+
     actual = metrics(res)["sharpe"]
     return {
         "actual_sharpe": actual,
@@ -158,11 +163,10 @@ def deflated_sharpe(sharpe: float, n_bars: int, n_trials: int) -> float:
         return sharpe
     from math import log, sqrt
 
-    euler = 0.5772156649
     # expected max Sharpe of n_trials independent, truly-zero-edge strategies
     e_max = sqrt(2 * log(n_trials)) - (log(log(n_trials)) + log(4 * np.pi)) / (
         2 * sqrt(2 * log(n_trials))
-    ) + euler * (sqrt(2 * log(n_trials)) - sqrt(2 * log(n_trials)))
+    )
     return round(float(sharpe - e_max / sqrt(n_bars / TRADING_DAYS)), 3)
 
 

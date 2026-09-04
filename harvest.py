@@ -43,6 +43,22 @@ def slugify(text: str, maxlen: int = 60) -> str:
     return s[:maxlen].rstrip("-")
 
 
+def entry_row(url: str, title: str, source: str | None, blurb: str,
+              posted: str | None, posted_raw: str) -> dict:
+    """One harvested article, shared by the mashup and daily-wrap routes."""
+    return {
+        "url": url,
+        "title": title,
+        "source": source,
+        "blurb": blurb,
+        "posted": posted,          # publication date == natural OOS boundary
+        "posted_raw": posted_raw,
+        "slug": slugify(title),
+        "harvested_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "stage": "harvested",      # harvested -> triaged -> spec -> backtested
+    }
+
+
 def parse_page(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     rows = []
@@ -68,19 +84,7 @@ def parse_page(html: str) -> list[dict]:
             except ValueError:
                 pass
 
-        rows.append(
-            {
-                "url": a["href"],
-                "title": title,
-                "source": source,
-                "blurb": blurb,
-                "posted": posted,          # publication date == natural OOS boundary
-                "posted_raw": foot_txt,
-                "slug": slugify(title),
-                "harvested_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "stage": "harvested",      # harvested -> triaged -> spec -> backtested
-            }
-        )
+        rows.append(entry_row(a["href"], title, source, blurb, posted, foot_txt))
     return rows
 
 
@@ -99,7 +103,6 @@ def parse_wrap(html: str, posted: str | None) -> list[dict]:
     body = soup.select_one("div.entry-content")
     if not body:
         return []
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows = []
     for a in body.select("a[href]"):
         href = a["href"]
@@ -111,19 +114,7 @@ def parse_wrap(html: str, posted: str | None) -> list[dict]:
         title, source = (m.group("title"), m.group("source")) if m else (raw.rstrip(" ["), None)
         if not title:
             continue
-        rows.append(
-            {
-                "url": href,
-                "title": title,
-                "source": source,
-                "blurb": "",
-                "posted": posted,
-                "posted_raw": posted or "",
-                "slug": slugify(title),
-                "harvested_at": now,
-                "stage": "harvested",
-            }
-        )
+        rows.append(entry_row(href, title, source, "", posted, posted or ""))
     return rows
 
 
