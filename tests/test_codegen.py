@@ -2,10 +2,6 @@
 """Tests for codegen.py — smoke testing generated strategy modules."""
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
-import pytest
-
 import codegen
 
 
@@ -71,12 +67,17 @@ class TestSmokeTest:
         assert err is not None and "Series" in err
 
     def test_params_are_forwarded(self, tmp_path):
+        # the module returns NaN unless the param equals the forwarded value,
+        # so dropping the param makes the smoke fail
         f = self.write_module(tmp_path, (
             "import pandas as pd\n"
+            "import numpy as np\n"
             "def signal(df, lookback=5):\n"
+            "    if lookback != 10: return pd.Series(np.nan, index=df.index)\n"
             "    return (df.close > df.close.rolling(lookback).mean()).astype(float)\n"
         ))
         assert codegen.smoke_test(f, {"lookback": 10}) is None
+        assert codegen.smoke_test(f, {}) is not None
 
 
 class TestStripFence:
@@ -142,6 +143,24 @@ class TestGenerateOne:
         assert result["slug"] == "test-slug"
         assert "error" in result
 
+    def test_malformed_spec_returns_error_not_raise(self, tmp_path, monkeypatch):
+        spec_path = tmp_path / "specs" / "bad-slug.yaml"
+        spec_path.parent.mkdir(parents=True)
+        spec_path.write_text("not: [valid")  # unclosed flow sequence
+        monkeypatch.setattr(codegen.subprocess, "run", cli_stub(VALID_MODULE))
+        result = codegen.generate_one(spec_path, None)
+        assert "error" in result
+        assert result["slug"] == "bad-slug"
+
+    def test_slug_mismatch_returns_error(self, tmp_path, monkeypatch):
+        spec_path = tmp_path / "specs" / "mis.yaml"
+        spec_path.parent.mkdir(parents=True)
+        spec_path.write_text("meta:\n  slug: other-name\n")
+        monkeypatch.setattr(codegen.subprocess, "run", cli_stub(VALID_MODULE))
+        result = codegen.generate_one(spec_path, None)
+        assert "error" in result
+        assert "match" in result["error"]
+
 
 class TestPublish:
     def test_success_smoke_passes_and_publishes(self, tmp_path):
@@ -160,8 +179,22 @@ class TestPublish:
         stage = codegen.publish(result, spec, tmp_path / "strategies")
         assert stage == "codegen_failed"
         assert "signal" in (tmp_path / "strategies" / "test-slug.error").read_text()
-        # a module that failed smoke is never left in place
+        # a module that failed smoke is never left at the trusted name, in
+        # any form -- no crash can leave the slug marked as coded
         assert not (tmp_path / "strategies" / "test-slug.py").exists()
+        assert not (tmp_path / "strategies" / "test-slug.py.tmp").exists()
+
+    def test_superseded_error_marker_removed_on_success(self, tmp_path):
+        strategies = tmp_path / "strategies"
+        strategies.mkdir()
+        (strategies / "test-slug.error").write_text('{"error": "old failure"}\n')
+        spec = {"meta": {"slug": "test-slug"},
+                "signal": {"definition": "d", "lag_bars": 1}}
+        result = {"slug": "test-slug", "source": VALID_MODULE}
+        stage = codegen.publish(result, spec, strategies)
+        assert stage == "coded"
+        assert (strategies / "test-slug.py").exists()
+        assert not (strategies / "test-slug.error").exists()
 
     def test_cli_error_writes_marker_without_module(self, tmp_path):
         result = {"slug": "x", "error": "claude exited 1"}

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import importlib.machinery
 import importlib.util
 import json
 import re
@@ -71,7 +72,10 @@ def smoke_frame(n: int = 30) -> pd.DataFrame:
 
 def smoke_test(path: Path, params: dict) -> str | None:
     """Import the module and call signal on synthetic data. None = OK."""
-    spec_ = importlib.util.spec_from_file_location(f"strategies.{path.stem}", path)
+    name = f"strategies.{path.stem}"
+    spec_ = importlib.util.spec_from_file_location(
+        name, path,
+        loader=importlib.machinery.SourceFileLoader(name, str(path)))
     mod = importlib.util.module_from_spec(spec_)
     try:
         spec_.loader.exec_module(mod)
@@ -108,8 +112,14 @@ def pending_specs(specs_dir: Path, strategies_dir: Path, retry: bool) -> list[Pa
 
 def generate_one(spec_path: Path, model: str | None) -> dict:
     """One claude -p call -> {"slug", "source"} or {"slug", "error"}."""
-    spec = yaml.safe_load(spec_path.read_text())
-    slug = spec["meta"]["slug"]
+    try:
+        spec = yaml.safe_load(spec_path.read_text())
+        slug = spec["meta"]["slug"]
+    except (yaml.YAMLError, KeyError, AttributeError, TypeError, OSError) as exc:
+        return {"slug": spec_path.stem, "error": f"unreadable spec: {exc}"[:300]}
+    if slug != spec_path.stem:
+        return {"slug": spec_path.stem,
+                "error": "meta.slug does not match spec filename"}
     cmd = ["claude", "-p"] + (["--model", model] if model else [])
 
     try:
@@ -126,7 +136,8 @@ def generate_one(spec_path: Path, model: str | None) -> dict:
 
 
 def publish(result: dict, spec: dict, strategies_dir: Path) -> str:
-    """Smoke and publish one generated module. The artifact is the state."""
+    """Smoke-test at a temp path, then publish atomically. The artifact is
+    the state -- the trusted <slug>.py only ever appears if smoke passed."""
     slug = result["slug"]
     if "error" in result:
         _write_atomic(strategies_dir / f"{slug}.error",
@@ -134,16 +145,20 @@ def publish(result: dict, spec: dict, strategies_dir: Path) -> str:
         return "codegen_failed"
 
     path = strategies_dir / f"{slug}.py"
-    _write_atomic(path, result["source"])  # never visible half-written
+    tmp = path.with_suffix(".py.tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(result["source"])
 
     params = {k: v for k, v in spec.get("signal", {}).items()
               if k not in ("definition", "lag_bars")}
-    err = smoke_test(path, params)
+    err = smoke_test(tmp, params)
     if err:
-        path.unlink()  # a module that fails smoke is removed, not left trusted
+        tmp.unlink()  # a module that fails smoke is removed, never published
         _write_atomic(strategies_dir / f"{slug}.error",
                       json.dumps({"error": err}, indent=2))
         return "codegen_failed"
+    tmp.replace(path)  # never visible half-written
+    (strategies_dir / f"{slug}.error").unlink(missing_ok=True)  # code supersedes error
     return "coded"
 
 
