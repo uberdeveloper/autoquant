@@ -185,7 +185,10 @@ def main_with(argv: list[str] | None = None) -> int:
         futures = {pool.submit(generate_one, p, args.model): p for p in todo}
         for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
             spec_path = futures[fut]
-            spec = yaml.safe_load(spec_path.read_text())
+            try:
+                spec = yaml.safe_load(spec_path.read_text())
+            except (yaml.YAMLError, OSError):
+                spec = None  # error results never reach the spec-using path
             stage = publish(fut.result(), spec, STRATEGIES)
             stages[stage] = stages.get(stage, 0) + 1
             mark = "OK  " if stage == "coded" else "FAIL"
