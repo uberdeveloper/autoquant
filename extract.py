@@ -116,3 +116,86 @@ def extract_one(row: dict, rubric: str, model: str | None) -> dict:
     if errors:
         return {"url": row["url"], "error": "invalid spec: " + "; ".join(errors)}
     return {"url": row["url"], "spec": spec}
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Publish atomically -- downstream stages never observe a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def publish(row: dict, result: dict, specs_dir: Path) -> str:
+    """Record one extract outcome under specs/. The artifact is the state --
+    articles.jsonl is never rewritten here."""
+    slug = row["slug"]
+    if "error" in result:
+        _write_atomic(specs_dir / f"{slug}.error",
+                      json.dumps({"url": row["url"], "error": result["error"]}, indent=2))
+        return "extract_failed"
+
+    spec = result["spec"]
+    if spec.get("verdict", {}).get("status") == "UNTESTABLE":
+        _write_atomic(specs_dir / f"{slug}.untestable",
+                      json.dumps({"url": row["url"],
+                                  "reason": spec["verdict"].get("reason", "")}, indent=2))
+        return "untestable"
+
+    _write_atomic(specs_dir / f"{slug}.yaml", yaml.safe_dump(spec, sort_keys=False))
+    return "spec"
+
+
+def pending(rows: list[dict], specs_dir: Path, retry: bool) -> list[dict]:
+    """Triaged articles with no extract outcome yet. A .error marker counts
+    as an outcome unless retry is set; .untestable is always final."""
+    done = {p.stem for p in specs_dir.glob("*.yaml")}
+    done |= {p.stem for p in specs_dir.glob("*.untestable")}
+    if not retry:
+        done |= {p.stem for p in specs_dir.glob("*.error")}
+    return [r for r in rows
+            if r.get("stage") == "triaged" and r["slug"] not in done]
+
+
+def main_with(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=0, help="0 = no limit")
+    ap.add_argument("--jobs", type=int, default=2, help="concurrent claude calls")
+    ap.add_argument("--model", default=None, help="override the model")
+    ap.add_argument("--respec", action="store_true",
+                    help="also retry slugs with a specs/<slug>.error marker")
+    args = ap.parse_args(argv)
+
+    rubric = PROMPT.read_text()
+    rows = load(ARTICLES)  # read-only -- publish() never rewrites this file
+    todo = pending(rows, SPECS, args.respec)
+    if args.limit:
+        todo = todo[:args.limit]
+    if not todo:
+        print("nothing to extract -- run triage.py first, or pass --respec")
+        return 0
+
+    print(f"extracting {len(todo)} articles ({args.jobs} at a time)\n")
+    by_url = {r["url"]: r for r in todo}
+    stages: dict[str, int] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = {pool.submit(extract_one, r, rubric, args.model): r for r in todo}
+        for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+            row = by_url[fut.result()["url"]]
+            stage = publish(row, fut.result(), SPECS)
+            stages[stage] = stages.get(stage, 0) + 1
+            mark = "OK  " if stage == "spec" else "FAIL" if stage == "extract_failed" else "SKIP"
+            print(f"[{i}/{len(todo)}] {mark}  {stage:<15} {row['title'][:50]}")
+
+    print("\nstages:", ", ".join(f"{k}={v}" for k, v in sorted(stages.items())))
+    print(f"specs -> {SPECS.relative_to(ROOT)}/")
+    return 0
+
+
+def main() -> int:
+    return main_with()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
