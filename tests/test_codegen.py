@@ -96,3 +96,133 @@ class TestBuildPrompt:
         assert "def signal" in prompt
         assert "slug: s" in prompt
         assert "do NOT shift" in prompt
+
+
+VALID_MODULE = (
+    "import pandas as pd\n"
+    "def signal(df, **params):\n"
+    "    return (df.close > df.close.rolling(5).mean()).astype(float)\n"
+)
+
+
+def cli_stub(stdout, returncode=0):
+    def fake_run(*a, **k):
+        class Proc:
+            pass
+        Proc.returncode = returncode
+        Proc.stdout = stdout
+        Proc.stderr = ""
+        return Proc()
+    return fake_run
+
+
+def write_spec(tmp_path, slug="test-slug"):
+    p = tmp_path / "specs" / f"{slug}.yaml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("meta:\n"
+                 f"  slug: {slug}\n"
+                 "signal:\n"
+                 "  definition: d\n"
+                 "  lag_bars: 1\n")
+    return p
+
+
+class TestGenerateOne:
+    def test_valid_reply_returns_source(self, tmp_path, monkeypatch):
+        spec_path = write_spec(tmp_path)
+        monkeypatch.setattr(codegen.subprocess, "run", cli_stub(VALID_MODULE))
+        result = codegen.generate_one(spec_path, None)
+        assert result["slug"] == "test-slug"
+        assert "def signal" in result["source"]
+
+    def test_cli_failure_returns_error(self, tmp_path, monkeypatch):
+        spec_path = write_spec(tmp_path)
+        monkeypatch.setattr(codegen.subprocess, "run", cli_stub("", returncode=1))
+        result = codegen.generate_one(spec_path, None)
+        assert result["slug"] == "test-slug"
+        assert "error" in result
+
+
+class TestPublish:
+    def test_success_smoke_passes_and_publishes(self, tmp_path):
+        spec = {"meta": {"slug": "test-slug"},
+                "signal": {"definition": "d", "lag_bars": 1}}
+        result = {"slug": "test-slug", "source": VALID_MODULE}
+        stage = codegen.publish(result, spec, tmp_path / "strategies")
+        assert stage == "coded"
+        assert (tmp_path / "strategies" / "test-slug.py").exists()
+        assert not (tmp_path / "strategies" / "test-slug.py.tmp").exists()
+
+    def test_smoke_failure_removes_module_and_writes_marker(self, tmp_path):
+        spec = {"meta": {"slug": "test-slug"},
+                "signal": {"definition": "d", "lag_bars": 1}}
+        result = {"slug": "test-slug", "source": "x = 1\n"}  # no signal()
+        stage = codegen.publish(result, spec, tmp_path / "strategies")
+        assert stage == "codegen_failed"
+        assert "signal" in (tmp_path / "strategies" / "test-slug.error").read_text()
+        # a module that failed smoke is never left in place
+        assert not (tmp_path / "strategies" / "test-slug.py").exists()
+
+    def test_cli_error_writes_marker_without_module(self, tmp_path):
+        result = {"slug": "x", "error": "claude exited 1"}
+        stage = codegen.publish(result, {"meta": {"slug": "x"}}, tmp_path / "strategies")
+        assert stage == "codegen_failed"
+        assert (tmp_path / "strategies" / "x.error").exists()
+
+
+class TestPendingSpecs:
+    def test_skips_coded_slugs(self, tmp_path):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        (specs / "a.yaml").write_text("meta:\n  slug: a\n")
+        (specs / "b.yaml").write_text("meta:\n  slug: b\n")
+        strategies = tmp_path / "strategies"
+        strategies.mkdir()
+        (strategies / "a.py").write_text("# done\n")
+        todo = codegen.pending_specs(specs, strategies, retry=False)
+        assert [p.stem for p in todo] == ["b"]
+
+    def test_error_marker_blocks_retry_unless_flag(self, tmp_path):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        (specs / "a.yaml").write_text("meta:\n  slug: a\n")
+        strategies = tmp_path / "strategies"
+        strategies.mkdir()
+        (strategies / "a.error").write_text("{}\n")
+        assert codegen.pending_specs(specs, strategies, retry=False) == []
+        assert [p.stem for p in codegen.pending_specs(specs, strategies, retry=True)] == ["a"]
+
+
+class TestMain:
+    def test_runs_and_resumes_without_articles_jsonl(self, tmp_path, monkeypatch, capsys):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        (specs / "a.yaml").write_text(
+            "meta:\n  slug: a\nsignal:\n  definition: d\n  lag_bars: 1\n")
+        strategies = tmp_path / "strategies"
+
+        monkeypatch.setattr(codegen, "ROOT", tmp_path)
+        monkeypatch.setattr(codegen, "SPECS", specs)
+        monkeypatch.setattr(codegen, "STRATEGIES", strategies)
+
+        calls = []
+
+        def fake_run(*a, **k):
+            calls.append(1)
+
+            class Proc:
+                returncode = 0
+                stdout = VALID_MODULE
+                stderr = ""
+
+            return Proc()
+
+        monkeypatch.setattr(codegen.subprocess, "run", fake_run)
+
+        assert codegen.main_with(["--jobs", "1"]) == 0
+        assert (strategies / "a.py").exists()
+        assert not (tmp_path / "data").exists()  # codegen never touches articles
+
+        # resume: a second run finds nothing to do and makes zero CLI calls
+        assert codegen.main_with(["--jobs", "1"]) == 0
+        assert len(calls) == 1
