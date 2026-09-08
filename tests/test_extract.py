@@ -80,3 +80,87 @@ class TestValidateSpec:
     def test_untestable_without_reason_rejected(self):
         doc = {"meta": {"slug": "x"}, "verdict": {"status": "UNTESTABLE"}}
         assert any("reason" in e for e in extract.validate_spec(doc))
+
+
+class TestExtractOne:
+    ROW = {"url": "https://a.com/x", "title": "T", "source": "S",
+           "posted": "2026-08-09", "slug": "test-slug", "page": "p.md"}
+
+    def test_valid_reply_returns_spec(self, tmp_path, monkeypatch):
+        page = tmp_path / "p.md"
+        page.write_text("---\n\narticle body\n")
+        monkeypatch.setattr(extract, "ROOT", tmp_path)
+
+        reply = yaml.safe_dump(VALID_SPEC)
+        recorded = {}
+
+        def fake_run(cmd, input, capture_output, text, timeout):
+            recorded["cmd"] = cmd
+            recorded["input"] = input
+
+            class Proc:
+                returncode = 0
+                stdout = reply
+                stderr = ""
+
+            return Proc()
+
+        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        result = extract.extract_one(self.ROW, "RUBRIC", None)
+        assert result["spec"]["meta"]["slug"] == "test-slug"
+        assert "claude" in recorded["cmd"]
+        assert "RUBRIC" in recorded["input"]
+
+    def test_invalid_yaml_returns_error(self, tmp_path, monkeypatch):
+        page = tmp_path / "p.md"
+        page.write_text("---\n\nbody\n")
+        monkeypatch.setattr(extract, "ROOT", tmp_path)
+
+        def fake_run(*a, **k):
+            class Proc:
+                returncode = 0
+                stdout = "not yaml at all: ["
+                stderr = ""
+            return Proc()
+
+        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        result = extract.extract_one(self.ROW, "RUBRIC", None)
+        assert "error" in result
+
+    def test_spec_failing_validation_returns_error(self, tmp_path, monkeypatch):
+        page = tmp_path / "p.md"
+        page.write_text("---\n\nbody\n")
+        monkeypatch.setattr(extract, "ROOT", tmp_path)
+        bad = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
+        bad["signal"]["lag_bars"] = 0
+
+        def fake_run(*a, **k):
+            class Proc:
+                returncode = 0
+                stdout = yaml.safe_dump(bad)
+                stderr = ""
+            return Proc()
+
+        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        result = extract.extract_one(self.ROW, "RUBRIC", None)
+        assert "invalid spec" in result["error"]
+        assert "lag_bars" in result["error"]
+
+    def test_model_flag_passed_through(self, tmp_path, monkeypatch):
+        page = tmp_path / "p.md"
+        page.write_text("---\n\nbody\n")
+        monkeypatch.setattr(extract, "ROOT", tmp_path)
+        seen = {}
+
+        def fake_run(cmd, **k):
+            seen["cmd"] = cmd
+
+            class Proc:
+                returncode = 0
+                stdout = yaml.safe_dump(VALID_SPEC)
+                stderr = ""
+            return Proc()
+
+        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        extract.extract_one(self.ROW, "RUBRIC", "claude-sonnet-4-6")
+        assert "--model" in seen["cmd"]

@@ -91,3 +91,28 @@ def build_prompt(rubric: str, row: dict, body: str) -> str:
         "markdown fence, no prose.\n\n"
         f"{json.dumps(payload, ensure_ascii=False)}\n"
     )
+
+
+def extract_one(row: dict, rubric: str, model: str | None) -> dict:
+    """One claude -p call -> {"url", "spec"} or {"url", "error"}."""
+    page = ROOT / row["page"]
+    cmd = ["claude", "-p"] + (["--model", model] if model else [])
+    prompt = build_prompt(rubric, row, strip_body(page))
+
+    try:
+        proc = subprocess.run(cmd, input=prompt, capture_output=True,
+                              text=True, timeout=CLI_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"url": row["url"], "error": f"claude CLI timed out after {CLI_TIMEOUT}s"}
+    if proc.returncode != 0:
+        return {"url": row["url"], "error": f"claude exited {proc.returncode}: {proc.stderr[:200]}"}
+
+    try:
+        spec = parse_spec(proc.stdout)
+    except (ValueError, yaml.YAMLError) as exc:
+        return {"url": row["url"], "error": f"unparseable YAML: {exc}"[:300]}
+
+    errors = validate_spec(spec)
+    if errors:
+        return {"url": row["url"], "error": "invalid spec: " + "; ".join(errors)}
+    return {"url": row["url"], "spec": spec}
