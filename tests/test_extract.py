@@ -81,6 +81,10 @@ class TestValidateSpec:
         doc = {"meta": {"slug": "x"}, "verdict": {"status": "UNTESTABLE"}}
         assert any("reason" in e for e in extract.validate_spec(doc))
 
+    def test_scalar_verdict_rejected_not_crash(self):
+        errors = extract.validate_spec({"verdict": "UNTESTABLE"})
+        assert any("verdict" in e for e in errors)
+
 
 class TestExtractOne:
     ROW = {"url": "https://a.com/x", "title": "T", "source": "S",
@@ -165,6 +169,71 @@ class TestExtractOne:
         extract.extract_one(self.ROW, "RUBRIC", "claude-sonnet-4-6")
         assert "--model" in seen["cmd"]
 
+    def test_timeout_returns_error(self, tmp_path, monkeypatch):
+        page = tmp_path / "p.md"
+        page.write_text("---\n\nbody\n")
+        monkeypatch.setattr(extract, "ROOT", tmp_path)
+
+        def fake_run(*a, **k):
+            raise extract.subprocess.TimeoutExpired(cmd="claude", timeout=600)
+
+        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        result = extract.extract_one(self.ROW, "RUBRIC", None)
+        assert "timed out" in result["error"]
+
+    def test_nonzero_exit_returns_error(self, tmp_path, monkeypatch):
+        page = tmp_path / "p.md"
+        page.write_text("---\n\nbody\n")
+        monkeypatch.setattr(extract, "ROOT", tmp_path)
+
+        def fake_run(*a, **k):
+            class Proc:
+                returncode = 1
+                stdout = ""
+                stderr = "boom"
+
+            return Proc()
+
+        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        result = extract.extract_one(self.ROW, "RUBRIC", None)
+        assert "claude exited 1" in result["error"]
+
+    def test_scalar_verdict_becomes_error_not_crash(self, tmp_path, monkeypatch):
+        page = tmp_path / "p.md"
+        page.write_text("---\n\nbody\n")
+        monkeypatch.setattr(extract, "ROOT", tmp_path)
+
+        def fake_run(*a, **k):
+            class Proc:
+                returncode = 0
+                stdout = "verdict: UNTESTABLE\n"
+                stderr = ""
+
+            return Proc()
+
+        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        result = extract.extract_one(self.ROW, "RUBRIC", None)
+        assert "invalid spec" in result["error"]
+
+    def test_string_costs_do_not_crash(self, tmp_path, monkeypatch):
+        page = tmp_path / "p.md"
+        page.write_text("---\n\nbody\n")
+        monkeypatch.setattr(extract, "ROOT", tmp_path)
+        doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
+        doc["costs"] = {"commission_bps": "5", "slippage_bps": "5"}
+
+        def fake_run(*a, **k):
+            class Proc:
+                returncode = 0
+                stdout = yaml.safe_dump(doc)
+                stderr = ""
+
+            return Proc()
+
+        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        result = extract.extract_one(self.ROW, "RUBRIC", None)
+        assert ("spec" in result) != ("error" in result)  # outcome, not exception
+
 
 class TestPublish:
     def test_success_writes_spec_atomically(self, tmp_path):
@@ -192,6 +261,17 @@ class TestPublish:
         stage = extract.publish(row, result, tmp_path / "specs")
         assert stage == "extract_failed"
         assert "claude exited 1" in (tmp_path / "specs" / "vix-thing.error").read_text()
+
+    def test_success_supersedes_prior_error_marker(self, tmp_path):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        (specs / "test-slug.error").write_text("{}\n")
+        row = {"url": "https://a.com/x", "slug": "test-slug"}
+        result = {"url": row["url"], "spec": yaml.safe_load(yaml.safe_dump(VALID_SPEC))}
+        stage = extract.publish(row, result, specs)
+        assert stage == "spec"
+        assert (specs / "test-slug.yaml").exists()
+        assert not (specs / "test-slug.error").exists()
 
 
 class TestPending:
