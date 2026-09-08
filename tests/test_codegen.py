@@ -259,3 +259,19 @@ class TestMain:
         # resume: a second run finds nothing to do and makes zero CLI calls
         assert codegen.main_with(["--jobs", "1"]) == 0
         assert len(calls) == 1
+
+    def test_malformed_spec_fails_gracefully(self, tmp_path, monkeypatch):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        (specs / "bad.yaml").write_text("not: [valid")  # unclosed flow sequence
+        strategies = tmp_path / "strategies"
+
+        monkeypatch.setattr(codegen, "ROOT", tmp_path)
+        monkeypatch.setattr(codegen, "SPECS", specs)
+        monkeypatch.setattr(codegen, "STRATEGIES", strategies)
+        monkeypatch.setattr(codegen.subprocess, "run", cli_stub(VALID_MODULE))
+
+        assert codegen.main_with(["--jobs", "1"]) == 0  # no raise, batch survives
+        marker = strategies / "bad.error"
+        assert marker.exists()
+        assert "unreadable spec" in marker.read_text()
