@@ -88,3 +88,102 @@ def smoke_test(path: Path, params: dict) -> str | None:
     if not np.isfinite(pd.to_numeric(out, errors="coerce")).all():
         return "signal returned non-finite values"
     return None
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def pending_specs(specs_dir: Path, strategies_dir: Path, retry: bool) -> list[Path]:
+    """Specs with no codegen outcome yet. A .error marker counts as an
+    outcome unless retry is set."""
+    done = {p.stem for p in strategies_dir.glob("*.py")}
+    if not retry:
+        done |= {p.stem for p in strategies_dir.glob("*.error")}
+    return [p for p in sorted(specs_dir.glob("*.yaml")) if p.stem not in done]
+
+
+def generate_one(spec_path: Path, model: str | None) -> dict:
+    """One claude -p call -> {"slug", "source"} or {"slug", "error"}."""
+    spec = yaml.safe_load(spec_path.read_text())
+    slug = spec["meta"]["slug"]
+    cmd = ["claude", "-p"] + (["--model", model] if model else [])
+
+    try:
+        proc = subprocess.run(cmd, input=build_prompt(spec), capture_output=True,
+                              text=True, timeout=CLI_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"slug": slug, "error": f"claude CLI timed out after {CLI_TIMEOUT}s"}
+    if proc.returncode != 0:
+        return {"slug": slug, "error": f"claude exited {proc.returncode}: {proc.stderr[:200]}"}
+    source = strip_fence(proc.stdout)
+    if not source:
+        return {"slug": slug, "error": "empty reply"}
+    return {"slug": slug, "source": source}
+
+
+def publish(result: dict, spec: dict, strategies_dir: Path) -> str:
+    """Smoke and publish one generated module. The artifact is the state."""
+    slug = result["slug"]
+    if "error" in result:
+        _write_atomic(strategies_dir / f"{slug}.error",
+                      json.dumps({"error": result["error"]}, indent=2))
+        return "codegen_failed"
+
+    path = strategies_dir / f"{slug}.py"
+    _write_atomic(path, result["source"])  # never visible half-written
+
+    params = {k: v for k, v in spec.get("signal", {}).items()
+              if k not in ("definition", "lag_bars")}
+    err = smoke_test(path, params)
+    if err:
+        path.unlink()  # a module that fails smoke is removed, not left trusted
+        _write_atomic(strategies_dir / f"{slug}.error",
+                      json.dumps({"error": err}, indent=2))
+        return "codegen_failed"
+    return "coded"
+
+
+def main_with(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=0, help="0 = no limit")
+    ap.add_argument("--jobs", type=int, default=2, help="concurrent claude calls")
+    ap.add_argument("--model", default=None, help="override the model")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="also retry specs with a strategies/<slug>.error marker")
+    args = ap.parse_args(argv)
+
+    todo = pending_specs(SPECS, STRATEGIES, args.retry_failed)
+    if args.limit:
+        todo = todo[:args.limit]
+    if not todo:
+        print("nothing to codegen -- run extract.py first, or pass --retry-failed")
+        return 0
+
+    print(f"codegen {len(todo)} specs ({args.jobs} at a time)\n")
+    stages: dict[str, int] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = {pool.submit(generate_one, p, args.model): p for p in todo}
+        for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+            spec_path = futures[fut]
+            spec = yaml.safe_load(spec_path.read_text())
+            stage = publish(fut.result(), spec, STRATEGIES)
+            stages[stage] = stages.get(stage, 0) + 1
+            mark = "OK  " if stage == "coded" else "FAIL"
+            print(f"[{i}/{len(todo)}] {mark}  {stage:<15} {spec_path.stem}")
+
+    print("\nstages:", ", ".join(f"{k}={v}" for k, v in sorted(stages.items())))
+    print(f"strategies -> {STRATEGIES.relative_to(ROOT)}/")
+    return 0
+
+
+def main() -> int:
+    return main_with()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
