@@ -69,11 +69,22 @@ def run_one(spec: Path, timeout: int) -> dict:
 
 
 def already_run(leaderboard: Path) -> set[str]:
-    """Slugs with a leaderboard row -- running them again is a no-op."""
+    """Slugs with a leaderboard row -- running them again is a no-op.
+
+    Tolerates a torn or blank line: a crash mid-write must not make every
+    future resume raise. Lines that fail to parse or lack a slug are skipped.
+    """
     if not leaderboard.exists():
         return set()
-    return {json.loads(line)["slug"]
-            for line in leaderboard.read_text().splitlines() if line.strip()}
+    done: set[str] = set()
+    for line in leaderboard.read_text().splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("slug"):
+            done.add(row["slug"])
+    return done
 
 
 def record_failure(result: dict, path: Path) -> None:
