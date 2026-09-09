@@ -423,6 +423,70 @@ class TestEndToEndRun:
         assert out["in_sample"]["n_bars"] + out["out_of_sample"]["n_bars"] == 80
 
 
+class TestMultiUniverseRun:
+    def make_env(self, tmp_path, monkeypatch, signal_body):
+        """Two cached tickers + a strategy module + a full valid spec."""
+        monkeypatch.setattr(backtest, "ROOT", tmp_path)
+
+        prices = tmp_path / "data" / "prices"
+        prices.mkdir(parents=True)
+        for t, df in make_panel(60).items():
+            df.to_csv(prices / f"{t}.csv")
+
+        strategies = tmp_path / "strategies"
+        strategies.mkdir()
+        (strategies / "multi-ser.py").write_text(
+            "import pandas as pd\n"
+            "def signal(data, **params):\n"
+            "    idx = next(iter(data.values())).index\n"
+            f"{signal_body}"
+        )
+
+        spec = {
+            "meta": {
+                "slug": "multi-ser", "title": "Multi Test",
+                "source": "test", "url": "https://a.com", "posted": "2020-03-02",
+                "claim": "equal weight two assets",
+                "author_evidence": {"headline_metrics": "n/a", "sample": "n/a",
+                                    "costs_included": False},
+            },
+            "data": {"universe": ["AAA", "BBB"], "start": "2020-01-01"},
+            "signal": {"definition": "equal weight", "lag_bars": 1},
+            "rules": {"max_leverage": 1.0},
+            "costs": {"commission_bps": 5, "slippage_bps": 5},
+            "validation": {
+                "cost_sweep_bps": [0, 50],
+                "param_sweep": None,
+                "multiple_testing": {"n_tested_so_far": 3},
+                "min_trades": 1,
+            },
+            "verdict": {"status": "unknown", "reason": None},
+            "ambiguities": [],
+        }
+        spec_path = tmp_path / "spec.yaml"
+        spec_path.write_text(yaml.safe_dump(spec))
+        return spec_path
+
+    def test_multi_universe_requires_dataframe_weights(self, tmp_path, monkeypatch):
+        sp = self.make_env(
+            tmp_path, monkeypatch,
+            "    return pd.Series(1.0, index=idx)\n")
+        with pytest.raises(SystemExit, match="weights DataFrame"):
+            backtest.run(sp, n_trials=1)
+
+    def test_multi_universe_end_to_end(self, tmp_path, monkeypatch):
+        sp = self.make_env(
+            tmp_path, monkeypatch,
+            "    return pd.DataFrame(1.0 / len(data), index=idx, columns=list(data))\n")
+        out = backtest.run(sp, n_trials=1)
+        assert out["full"]["n_bars"] == 60
+        assert "benchmark_bh" in out
+        assert out["benchmark_bh"]["n_bars"] == 60
+        assert set(out["cost_sweep"]) == {"0bps", "50bps"}
+        assert isinstance(out["auto_flags"], list)
+        assert out["in_sample"]["n_bars"] + out["out_of_sample"]["n_bars"] == 60
+
+
 class TestLoadStrategy:
     def test_missing_module_exits(self, tmp_path, monkeypatch):
         monkeypatch.setattr(backtest, "ROOT", tmp_path)

@@ -244,22 +244,51 @@ def run(spec_path: Path, n_trials: int | None) -> dict:
     mod = load_strategy(slug)
 
     tickers = spec["data"]["universe"]
-    if len(tickers) != 1:
-        sys.exit("this skeleton handles single-asset specs; extend for cross-sectional")
-    df = load_prices(tickers[0], spec["data"]["start"], spec["data"].get("end"),
-                     ROOT / "data" / "prices")
-    if df.empty:
-        sys.exit(f"no price data for {tickers[0]}")
 
     params = {k: v for k, v in spec["signal"].items() if k not in ("definition", "lag_bars")}
-    res = backtest(df, mod.signal(df, **params), spec)
+
+    def load_inputs(spec_variant: dict):
+        if len(tickers) == 1:
+            df = load_prices(tickers[0], spec_variant["data"]["start"],
+                             spec_variant["data"].get("end"), ROOT / "data" / "prices")
+            if df.empty:
+                sys.exit(f"no price data for {tickers[0]}")
+            return df
+        data, _ = load_panel(tickers, spec_variant["data"]["start"],
+                             spec_variant["data"].get("end"), ROOT / "data" / "prices")
+        return data
+
+    def evaluate(spec_variant: dict, params_override: dict) -> pd.DataFrame:
+        """One full evaluation of a (possibly mutated) spec. Shared by the
+        headline run, the cost sweep and the parameter sweep so multi-asset
+        universes sweep correctly too."""
+        inputs = load_inputs(spec_variant)
+        if len(tickers) == 1:
+            return backtest(inputs, mod.signal(inputs, **params_override), spec_variant)
+        w = mod.signal(inputs, **params_override)
+        if not isinstance(w, pd.DataFrame):
+            sys.exit("multi-asset universe requires signal() to return a weights DataFrame "
+                     "(one column per ticker)")
+        return backtest_multi(inputs, w, spec_variant)
+
+    res = evaluate(spec, params)
+
+    if len(tickers) == 1:
+        benchmark = buy_and_hold(res)
+    else:
+        # equal-weight B&H through the same multi-asset engine, zero-cost
+        inputs = load_inputs(spec)
+        bw = pd.DataFrame(1.0 / len(tickers),
+                          index=next(iter(inputs.values())).index, columns=tickers)
+        bh = backtest_multi(inputs, bw, spec)
+        benchmark = metrics(bh.assign(cost=0.0, net=bh["gross"]))
 
     posted = pd.Timestamp(spec["meta"]["posted"])
     out = {
         "slug": slug,
         "full": metrics(res),
         "gross": metrics(res, "gross"),
-        "benchmark_bh": buy_and_hold(res),
+        "benchmark_bh": benchmark,
         "in_sample": metrics(res[res.index < posted]) if (res.index < posted).any() else {},
         "out_of_sample": metrics(res[res.index >= posted]) if (res.index >= posted).any() else {},
     }
@@ -269,13 +298,13 @@ def run(spec_path: Path, n_trials: int | None) -> dict:
     for bps in spec["validation"]["cost_sweep_bps"]:
         s2 = copy.deepcopy(spec)
         s2["costs"]["commission_bps"], s2["costs"]["slippage_bps"] = 0, bps
-        out["cost_sweep"][f"{bps}bps"] = metrics(backtest(df, mod.signal(df, **params), s2))["sharpe"]
+        out["cost_sweep"][f"{bps}bps"] = metrics(evaluate(s2, params))["sharpe"]
 
     # parameter neighbourhood — is the result a spike or a plateau?
     out["param_sweep"] = {}
     for pname, values in (spec["validation"].get("param_sweep") or {}).items():
         out["param_sweep"][pname] = {
-            str(v): metrics(backtest(df, mod.signal(df, **{**params, pname: v}), spec))["sharpe"]
+            str(v): metrics(evaluate(spec, {**params, pname: v}))["sharpe"]
             for v in values
         }
 
