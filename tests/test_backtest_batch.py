@@ -126,6 +126,12 @@ class TestAlreadyRun:
         lb.write_text('{"slug": "a"}\n\n{"slug": "b"}\n')
         assert backtest_batch.already_run(lb) == {"a", "b"}
 
+    def test_torn_or_slugless_lines_do_not_break_resume(self, tmp_path):
+        """One crash mid-write must not make every future resume raise."""
+        lb = tmp_path / "leaderboard.jsonl"
+        lb.write_text('{"slug": "a"}\n{"slug": "b", "torn\n\n{"verdict": 1}\n')
+        assert backtest_batch.already_run(lb) == {"a"}
+
     def test_missing_file_is_empty(self, tmp_path):
         assert backtest_batch.already_run(tmp_path / "nope.jsonl") == set()
 
