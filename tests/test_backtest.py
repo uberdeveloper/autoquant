@@ -360,3 +360,44 @@ class TestLoadStrategy:
         (strategies / "ok.py").write_text("def signal(df, **p):\n    return df.close\n")
         mod = backtest.load_strategy("ok")
         assert callable(mod.signal)
+
+
+class TestAppendLeaderboard:
+    def make_spec_and_out(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(backtest, "ROOT", tmp_path)
+        spec = {"verdict": {"status": "WEAKER", "reason": "r"}}
+        df = make_prices()
+        res = backtest.backtest(df, pd.Series(1.0, index=df.index), BASE_SPEC)
+        out = {
+            "slug": "always-in",
+            "full": backtest.metrics(res),
+            "null_test": {"beats_null_95": True},
+            "deflated_sharpe": 0.9,
+            "auto_flags": ["WEAK: does not beat buy-and-hold after costs"],
+        }
+        return spec, out
+
+    def test_appends_one_json_row(self, tmp_path, monkeypatch):
+        spec, out = self.make_spec_and_out(tmp_path, monkeypatch)
+        path = tmp_path / "results" / "leaderboard.jsonl"
+        backtest.append_leaderboard(spec, out, path)
+        rows = backtest.json.loads(path.read_text().splitlines()[0])
+        assert rows["slug"] == "always-in"
+        assert rows["verdict"] == "WEAKER"
+        assert rows["net_sharpe"] == out["full"]["sharpe"]
+        assert rows["deflated_sharpe"] == 0.9
+        assert rows["beats_null_95"] is True
+        assert rows["flags"] == out["auto_flags"]
+        assert "run_at" in rows
+
+    def test_appends_not_overwrites(self, tmp_path, monkeypatch):
+        spec, out = self.make_spec_and_out(tmp_path, monkeypatch)
+        path = tmp_path / "results" / "leaderboard.jsonl"
+        backtest.append_leaderboard(spec, out, path)
+        backtest.append_leaderboard(spec, out, path)
+        assert len(path.read_text().splitlines()) == 2
+
+    def test_creates_results_dir(self, tmp_path, monkeypatch):
+        spec, out = self.make_spec_and_out(tmp_path, monkeypatch)
+        path = backtest.append_leaderboard(spec, out, tmp_path / "results" / "leaderboard.jsonl")
+        assert path.exists()

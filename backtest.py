@@ -20,7 +20,9 @@ import argparse
 import copy
 import importlib.util
 import json
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -340,6 +342,33 @@ def write_report(spec_path: Path, out: dict) -> Path:
     return path
 
 
+def append_leaderboard(spec: dict, out: dict, path: Path | None = None) -> Path:
+    """One row per completed run — the leaderboard that feeds the
+    deflated-Sharpe n_tested_so_far count. Append-only; backtest_batch.py
+    treats an existing row as "already done"."""
+    path = path or (ROOT / "results" / "leaderboard.jsonl")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                capture_output=True, text=True, cwd=ROOT,
+                                timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        commit = ""
+    row = {
+        "slug": out["slug"],
+        "verdict": spec["verdict"]["status"],
+        "net_sharpe": out["full"]["sharpe"],
+        "deflated_sharpe": out["deflated_sharpe"],
+        "beats_null_95": out["null_test"].get("beats_null_95"),
+        "commit": commit,
+        "run_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "flags": out["auto_flags"],
+    }
+    with path.open("a") as fh:
+        fh.write(json.dumps(row) + "\n")
+    return path
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("spec", type=Path)
@@ -352,6 +381,7 @@ def main() -> int:
     if args.json:
         print(json.dumps(out, indent=2, default=str))
     report = write_report(args.spec, out)
+    append_leaderboard(yaml.safe_load(args.spec.read_text()), out)
     print(f"\n{out['slug']}: Sharpe {out['full']['sharpe']} net "
           f"(B&H {out['benchmark_bh']['sharpe']}), {out['full']['trades']} trades")
     for f in out["auto_flags"]:
