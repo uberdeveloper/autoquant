@@ -91,6 +91,90 @@ class TestBacktest:
         assert res["cost"].sum() > 0
 
 
+def make_panel(n=60, seed=0, tickers=("AAA", "BBB")):
+    dfs = {}
+    for i, t in enumerate(tickers):
+        rng = np.random.default_rng(seed + i)
+        close = 100 * np.cumprod(1 + rng.normal(0.001, 0.01, n))
+        open_ = np.roll(close, 1) * 0.99
+        open_[0] = 99.0
+        idx = pd.bdate_range("2020-01-01", periods=n)
+        dfs[t] = pd.DataFrame(
+            {"open": open_, "high": close * 1.01, "low": open_ * 0.99,
+             "close": close, "volume": 1e6}, index=idx)
+    return dfs
+
+
+MULTI_SPEC = {
+    "signal": {"definition": "test", "lag_bars": 1},
+    "rules": {"max_leverage": 1.0},
+    "costs": {"commission_bps": 10, "slippage_bps": 10},
+}
+
+
+class TestBacktestMulti:
+    def test_lag_no_lookahead(self):
+        data = make_panel()
+        w = pd.DataFrame(1.0, index=data["AAA"].index, columns=["AAA", "BBB"])
+        res = backtest.backtest_multi(data, w, MULTI_SPEC)
+        assert res["pos"].iloc[0] == 0.0   # no prior decision on bar 0
+
+    def test_gross_identity(self):
+        data = make_panel()
+        w = pd.DataFrame(0.5, index=data["AAA"].index, columns=["AAA", "BBB"])
+        res = backtest.backtest_multi(data, w, MULTI_SPEC)
+        pos = w.shift(1).fillna(0.0)  # within leverage cap, so pos == shifted w
+        rets = pd.DataFrame({t: d["close"].pct_change().fillna(0.0) for t, d in data.items()})
+        assert np.allclose(res["gross"], (pos * rets).sum(axis=1))
+        assert np.allclose(res["net"], res["gross"] - res["cost"])
+
+    def test_costs_are_per_asset_turnover(self):
+        data = make_panel()
+        w = pd.DataFrame(0.5, index=data["AAA"].index, columns=["AAA", "BBB"])
+        res = backtest.backtest_multi(data, w, MULTI_SPEC)
+        pos = w.shift(1).fillna(0.0)
+        expected = pos.diff().abs().fillna(pos.abs()).sum(axis=1) * 0.002
+        assert np.allclose(res["cost"], expected)
+
+    def test_row_leverage_scaled_down(self):
+        data = make_panel()
+        w = pd.DataFrame(1.0, index=data["AAA"].index, columns=["AAA", "BBB"])
+        res = backtest.backtest_multi(data, w, MULTI_SPEC)  # cap 1.0, raw row total 2.0
+        assert res["pos"].iloc[1] == pytest.approx(1.0)
+
+    def test_next_open_execution(self):
+        data = make_panel()
+        spec = {**MULTI_SPEC, "rules": {"execution_price": "next_open", "max_leverage": 1.0}}
+        w = pd.DataFrame(1.0, index=data["AAA"].index, columns=["AAA", "BBB"])
+        res = backtest.backtest_multi(data, w, spec)
+        rets = pd.DataFrame({t: (d["open"].shift(-1) / d["open"] - 1).fillna(0.0)
+                             for t, d in data.items()})
+        pos = (w * 0.5).shift(1).fillna(0.0)
+        assert np.allclose(res["gross"], (pos * rets).sum(axis=1))
+
+    def test_missing_weight_columns_filled_zero(self):
+        data = make_panel()
+        w = pd.DataFrame({"AAA": 1.0}, index=data["AAA"].index)
+        res = backtest.backtest_multi(data, w, MULTI_SPEC)
+        assert res["pos"].iloc[1] == pytest.approx(1.0)  # BBB column filled 0, AAA scaled 1.0
+
+
+class TestLoadPanel:
+    def test_outer_join_ffill_and_master_index(self, tmp_path):
+        a = make_panel(60, 0, ("AAA",))["AAA"]
+        b = make_panel(30, 1, ("BBB",))["BBB"]  # starts 30 bars later
+        b.index = b.index + pd.tseries.offsets.BusinessDay(30)
+        a.to_csv(tmp_path / "AAA.csv")
+        b.to_csv(tmp_path / "BBB.csv")
+        data, master = backtest.load_panel(["AAA", "BBB"], None, None, tmp_path)
+        assert list(data) == ["AAA", "BBB"]
+        assert data["AAA"].index.equals(master)
+        assert data["BBB"].index.equals(master)
+        assert master.equals(a.index)
+        assert data["BBB"]["close"].iloc[:30].isna().all()  # before first quote: NaN
+        assert data["BBB"]["close"].iloc[30:].notna().all()
+
+
 class TestMetrics:
     def test_full_output_keys(self):
         df = make_prices()
