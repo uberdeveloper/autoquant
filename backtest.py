@@ -56,6 +56,20 @@ def load_prices(ticker: str, start, end, cache_dir: Path) -> pd.DataFrame:
     return df
 
 
+def load_panel(tickers: list[str], start, end, cache_dir: Path):
+    """Load every ticker, outer-join calendars, ffill closes, reindex all
+    frames to the shared master index. Frames before a ticker's first quote
+    stay NaN — weights there must be 0 and the module decides."""
+    raw = {t: load_prices(t, None, None, cache_dir) for t in tickers}
+    closes = pd.concat({t: df["close"] for t, df in raw.items()}, axis=1).ffill()
+    master = closes.dropna(how="all").index
+    if start:
+        master = master[master >= pd.Timestamp(start)]
+    if end:
+        master = master[master <= pd.Timestamp(end)]
+    return {t: df.reindex(master) for t, df in raw.items()}, master
+
+
 # ---------------------------------------------------------------- backtest
 
 def backtest(df: pd.DataFrame, weights: pd.Series, spec: dict) -> pd.DataFrame:
@@ -92,6 +106,44 @@ def backtest(df: pd.DataFrame, weights: pd.Series, spec: dict) -> pd.DataFrame:
         {"pos": pos, "asset_ret": asset_ret, "gross": gross,
          "cost": cost + carry, "net": gross - cost - carry}
     )
+
+
+def backtest_multi(data: dict[str, pd.DataFrame], weights: pd.DataFrame,
+                   spec: dict) -> pd.DataFrame:
+    """Multi-asset twin of backtest(): same res columns, portfolio level.
+    pos = total weight, asset_ret = the portfolio's return source (gross/pos),
+    cost = per-asset turnover * per-side bps. Carry (borrow/financing) is not
+    modeled here; every current spec carries 0. The lag is applied per column —
+    the no-lookahead invariant is identical to the single-asset path."""
+    rules, costs = spec["rules"], spec["costs"]
+    lag = int(spec["signal"].get("lag_bars", 1))
+    master = next(iter(data.values())).index
+
+    w = (weights.reindex(columns=list(data)).reindex(master)
+         .fillna(0.0).astype(float))
+    lev = rules.get("max_leverage", 1.0)
+    w = w.clip(-lev, lev)
+    over = w.abs().sum(axis=1)
+    w = w.mul((lev / over).clip(upper=1.0), axis=0)   # row leverage cap
+    pos_frame = w.shift(lag).fillna(0.0)
+
+    if rules.get("execution_price") == "next_open":
+        rets = pd.DataFrame({t: (df["open"].shift(-1) / df["open"] - 1).fillna(0.0)
+                             for t, df in data.items()})
+    else:
+        rets = pd.DataFrame({t: df["close"].pct_change().fillna(0.0)
+                             for t, df in data.items()})
+
+    turnover = pos_frame.diff().abs()
+    turnover.iloc[0] = pos_frame.iloc[0].abs()
+    per_side = (costs.get("commission_bps", 0) + costs.get("slippage_bps", 0)) / 1e4
+    cost = turnover.sum(axis=1) * per_side
+
+    gross = (pos_frame * rets.reindex(columns=pos_frame.columns)).sum(axis=1)
+    total = pos_frame.sum(axis=1)
+    port_ret = (gross / total.where(total != 0)).fillna(0.0)
+    return pd.DataFrame({"pos": total, "asset_ret": port_ret, "gross": gross,
+                         "cost": cost, "net": gross - cost})
 
 
 def metrics(res: pd.DataFrame, col: str = "net") -> dict:
