@@ -74,6 +74,21 @@ class TestValidateSpec:
         doc["validation"]["oos_start"] = "2020-01-01"
         assert any("oos_start" in e for e in extract.validate_spec(doc, "test-slug"))
 
+    def test_rule_based_universe_rejected(self):
+        doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
+        doc["data"]["universe"] = "All US-listed stocks with mcap >= $1bn"
+        assert any("universe" in e for e in extract.validate_spec(doc, "test-slug"))
+
+    def test_explicit_mixed_asset_tickers_accepted(self):
+        doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
+        doc["data"]["universe"] = ["SPY", "BTC-USD", "GLD"]
+        assert extract.validate_spec(doc, "test-slug") == []
+
+    def test_lowercase_ticker_rejected(self):
+        doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
+        doc["data"]["universe"] = ["spy"]
+        assert any("universe" in e for e in extract.validate_spec(doc, "test-slug"))
+
     def test_matching_slug_accepted(self):
         assert extract.validate_spec(VALID_SPEC, "test-slug") == []
 
