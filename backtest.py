@@ -20,7 +20,9 @@ import argparse
 import copy
 import importlib.util
 import json
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +54,24 @@ def load_prices(ticker: str, start, end, cache_dir: Path) -> pd.DataFrame:
     if end:
         df = df[df.index <= pd.Timestamp(end)]
     return df
+
+
+def load_panel(tickers: list[str], start, end, cache_dir: Path):
+    """Load every ticker, outer-join calendars, and forward-fill each close
+    over the shared master index. A close survives untraded rows on the
+    master (its other columns keep NaN there), but stays NaN before the
+    ticker's first quote — weights there must be 0 and the module decides."""
+    raw = {t: load_prices(t, None, None, cache_dir) for t in tickers}
+    closes = pd.concat({t: df["close"] for t, df in raw.items()}, axis=1).ffill()
+    master = closes.dropna(how="all").index
+    if start:
+        master = master[master >= pd.Timestamp(start)]
+    if end:
+        master = master[master <= pd.Timestamp(end)]
+    frames = {t: df.reindex(master) for t, df in raw.items()}
+    for t in frames:
+        frames[t]["close"] = closes[t].reindex(master)
+    return frames, master
 
 
 # ---------------------------------------------------------------- backtest
@@ -90,6 +110,52 @@ def backtest(df: pd.DataFrame, weights: pd.Series, spec: dict) -> pd.DataFrame:
         {"pos": pos, "asset_ret": asset_ret, "gross": gross,
          "cost": cost + carry, "net": gross - cost - carry}
     )
+
+
+def backtest_multi(data: dict[str, pd.DataFrame], weights: pd.DataFrame,
+                   spec: dict) -> pd.DataFrame:
+    """Multi-asset twin of backtest(): same res columns, portfolio level.
+    pos = total weight, asset_ret = the portfolio's return source (gross/pos),
+    cost = per-asset turnover * per-side bps. Carry (borrow/financing) is not
+    modeled here; every current spec carries 0. The lag is applied per column —
+    the no-lookahead invariant is identical to the single-asset path.
+
+    Precondition: all frames in `data` share one DatetimeIndex (load_panel
+    guarantees it). Weight columns not in `data` are dropped; weight rows
+    absent from the index are treated as 0."""
+    rules, costs = spec["rules"], spec["costs"]
+    if costs.get("borrow_bps_annual", 0) or costs.get("financing_bps_annual", 0):
+        sys.exit("carry costs (borrow/financing) are not modeled for multi-asset "
+                 "universes; set borrow_bps_annual/financing_bps_annual to 0 or "
+                 "run a single-asset spec")
+    lag = int(spec["signal"].get("lag_bars", 1))
+    master = next(iter(data.values())).index
+
+    w = (weights.reindex(columns=list(data)).reindex(master)
+         .fillna(0.0).astype(float))
+    lev = rules.get("max_leverage", 1.0)
+    w = w.clip(-lev, lev)
+    over = w.abs().sum(axis=1)
+    w = w.mul((lev / over).clip(upper=1.0), axis=0)   # row leverage cap
+    pos_frame = w.shift(lag).fillna(0.0)
+
+    if rules.get("execution_price") == "next_open":
+        rets = pd.DataFrame({t: (df["open"].shift(-1) / df["open"] - 1).fillna(0.0)
+                             for t, df in data.items()})
+    else:
+        rets = pd.DataFrame({t: df["close"].pct_change().fillna(0.0)
+                             for t, df in data.items()})
+
+    turnover = pos_frame.diff().abs()
+    turnover.iloc[0] = pos_frame.iloc[0].abs()
+    per_side = (costs.get("commission_bps", 0) + costs.get("slippage_bps", 0)) / 1e4
+    cost = turnover.sum(axis=1) * per_side
+
+    gross = (pos_frame * rets.reindex(columns=pos_frame.columns)).sum(axis=1)
+    total = pos_frame.sum(axis=1)
+    port_ret = (gross / total.where(total != 0)).fillna(0.0)
+    return pd.DataFrame({"pos": total, "asset_ret": port_ret, "gross": gross,
+                         "cost": cost, "net": gross - cost})
 
 
 def metrics(res: pd.DataFrame, col: str = "net") -> dict:
@@ -190,22 +256,51 @@ def run(spec_path: Path, n_trials: int | None) -> dict:
     mod = load_strategy(slug)
 
     tickers = spec["data"]["universe"]
-    if len(tickers) != 1:
-        sys.exit("this skeleton handles single-asset specs; extend for cross-sectional")
-    df = load_prices(tickers[0], spec["data"]["start"], spec["data"].get("end"),
-                     ROOT / "data" / "prices")
-    if df.empty:
-        sys.exit(f"no price data for {tickers[0]}")
 
     params = {k: v for k, v in spec["signal"].items() if k not in ("definition", "lag_bars")}
-    res = backtest(df, mod.signal(df, **params), spec)
+
+    def load_inputs(spec_variant: dict):
+        if len(tickers) == 1:
+            df = load_prices(tickers[0], spec_variant["data"]["start"],
+                             spec_variant["data"].get("end"), ROOT / "data" / "prices")
+            if df.empty:
+                sys.exit(f"no price data for {tickers[0]}")
+            return df
+        data, _ = load_panel(tickers, spec_variant["data"]["start"],
+                             spec_variant["data"].get("end"), ROOT / "data" / "prices")
+        return data
+
+    def evaluate(spec_variant: dict, params_override: dict) -> pd.DataFrame:
+        """One full evaluation of a (possibly mutated) spec. Shared by the
+        headline run, the cost sweep and the parameter sweep so multi-asset
+        universes sweep correctly too."""
+        inputs = load_inputs(spec_variant)
+        if len(tickers) == 1:
+            return backtest(inputs, mod.signal(inputs, **params_override), spec_variant)
+        w = mod.signal(inputs, **params_override)
+        if not isinstance(w, pd.DataFrame):
+            sys.exit("multi-asset universe requires signal() to return a weights DataFrame "
+                     "(one column per ticker)")
+        return backtest_multi(inputs, w, spec_variant)
+
+    res = evaluate(spec, params)
+
+    if len(tickers) == 1:
+        benchmark = buy_and_hold(res)
+    else:
+        # equal-weight B&H through the same multi-asset engine, zero-cost
+        inputs = load_inputs(spec)
+        bw = pd.DataFrame(1.0 / len(tickers),
+                          index=next(iter(inputs.values())).index, columns=tickers)
+        bh = backtest_multi(inputs, bw, spec)
+        benchmark = metrics(bh.assign(cost=0.0, net=bh["gross"]))
 
     posted = pd.Timestamp(spec["meta"]["posted"])
     out = {
         "slug": slug,
         "full": metrics(res),
         "gross": metrics(res, "gross"),
-        "benchmark_bh": buy_and_hold(res),
+        "benchmark_bh": benchmark,
         "in_sample": metrics(res[res.index < posted]) if (res.index < posted).any() else {},
         "out_of_sample": metrics(res[res.index >= posted]) if (res.index >= posted).any() else {},
     }
@@ -215,13 +310,13 @@ def run(spec_path: Path, n_trials: int | None) -> dict:
     for bps in spec["validation"]["cost_sweep_bps"]:
         s2 = copy.deepcopy(spec)
         s2["costs"]["commission_bps"], s2["costs"]["slippage_bps"] = 0, bps
-        out["cost_sweep"][f"{bps}bps"] = metrics(backtest(df, mod.signal(df, **params), s2))["sharpe"]
+        out["cost_sweep"][f"{bps}bps"] = metrics(evaluate(s2, params))["sharpe"]
 
     # parameter neighbourhood — is the result a spike or a plateau?
     out["param_sweep"] = {}
     for pname, values in (spec["validation"].get("param_sweep") or {}).items():
         out["param_sweep"][pname] = {
-            str(v): metrics(backtest(df, mod.signal(df, **{**params, pname: v}), spec))["sharpe"]
+            str(v): metrics(evaluate(spec, {**params, pname: v}))["sharpe"]
             for v in values
         }
 
@@ -340,6 +435,38 @@ def write_report(spec_path: Path, out: dict) -> Path:
     return path
 
 
+def append_leaderboard(spec: dict, out: dict, path: Path | None = None) -> Path:
+    """One row per completed run — the leaderboard that feeds the
+    deflated-Sharpe n_tested_so_far count. Append-only; backtest_batch.py
+    treats an existing row as "already done".
+
+    A missing verdict is recorded as "unknown" rather than crashing: by the
+    time this runs, the backtest is finished and the report is written —
+    losing the row here would lose the whole run.
+    """
+    path = path or (ROOT / "results" / "leaderboard.jsonl")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                capture_output=True, text=True, cwd=ROOT,
+                                timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        commit = ""
+    row = {
+        "slug": out["slug"],
+        "verdict": (spec.get("verdict") or {}).get("status") or "unknown",
+        "net_sharpe": out["full"]["sharpe"],
+        "deflated_sharpe": out["deflated_sharpe"],
+        "beats_null_95": out["null_test"].get("beats_null_95"),
+        "commit": commit,
+        "run_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "flags": out["auto_flags"],
+    }
+    with path.open("a") as fh:
+        fh.write(json.dumps(row) + "\n")
+    return path
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("spec", type=Path)
@@ -352,6 +479,7 @@ def main() -> int:
     if args.json:
         print(json.dumps(out, indent=2, default=str))
     report = write_report(args.spec, out)
+    append_leaderboard(yaml.safe_load(args.spec.read_text()), out)
     print(f"\n{out['slug']}: Sharpe {out['full']['sharpe']} net "
           f"(B&H {out['benchmark_bh']['sharpe']}), {out['full']['trades']} trades")
     for f in out["auto_flags"]:

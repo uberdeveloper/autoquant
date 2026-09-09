@@ -91,6 +91,105 @@ class TestBacktest:
         assert res["cost"].sum() > 0
 
 
+def make_panel(n=60, seed=0, tickers=("AAA", "BBB")):
+    dfs = {}
+    for i, t in enumerate(tickers):
+        rng = np.random.default_rng(seed + i)
+        close = 100 * np.cumprod(1 + rng.normal(0.001, 0.01, n))
+        open_ = np.roll(close, 1) * 0.99
+        open_[0] = 99.0
+        idx = pd.bdate_range("2020-01-01", periods=n)
+        dfs[t] = pd.DataFrame(
+            {"open": open_, "high": close * 1.01, "low": open_ * 0.99,
+             "close": close, "volume": 1e6}, index=idx)
+    return dfs
+
+
+MULTI_SPEC = {
+    "signal": {"definition": "test", "lag_bars": 1},
+    "rules": {"max_leverage": 1.0},
+    "costs": {"commission_bps": 10, "slippage_bps": 10},
+}
+
+
+class TestBacktestMulti:
+    def test_lag_no_lookahead(self):
+        data = make_panel()
+        w = pd.DataFrame(1.0, index=data["AAA"].index, columns=["AAA", "BBB"])
+        res = backtest.backtest_multi(data, w, MULTI_SPEC)
+        assert res["pos"].iloc[0] == 0.0   # no prior decision on bar 0
+
+    def test_gross_identity(self):
+        data = make_panel()
+        w = pd.DataFrame(0.5, index=data["AAA"].index, columns=["AAA", "BBB"])
+        res = backtest.backtest_multi(data, w, MULTI_SPEC)
+        pos = w.shift(1).fillna(0.0)  # within leverage cap, so pos == shifted w
+        rets = pd.DataFrame({t: d["close"].pct_change().fillna(0.0) for t, d in data.items()})
+        assert np.allclose(res["gross"], (pos * rets).sum(axis=1))
+        assert np.allclose(res["net"], res["gross"] - res["cost"])
+
+    def test_costs_are_per_asset_turnover(self):
+        data = make_panel()
+        w = pd.DataFrame(0.5, index=data["AAA"].index, columns=["AAA", "BBB"])
+        res = backtest.backtest_multi(data, w, MULTI_SPEC)
+        pos = w.shift(1).fillna(0.0)
+        expected = pos.diff().abs().fillna(pos.abs()).sum(axis=1) * 0.002
+        assert np.allclose(res["cost"], expected)
+
+    def test_row_leverage_scaled_down(self):
+        data = make_panel()
+        w = pd.DataFrame(1.0, index=data["AAA"].index, columns=["AAA", "BBB"])
+        res = backtest.backtest_multi(data, w, MULTI_SPEC)  # cap 1.0, raw row total 2.0
+        assert res["pos"].iloc[1] == pytest.approx(1.0)
+
+    def test_next_open_execution(self):
+        data = make_panel()
+        spec = {**MULTI_SPEC, "rules": {"execution_price": "next_open", "max_leverage": 1.0}}
+        w = pd.DataFrame(1.0, index=data["AAA"].index, columns=["AAA", "BBB"])
+        res = backtest.backtest_multi(data, w, spec)
+        rets = pd.DataFrame({t: (d["open"].shift(-1) / d["open"] - 1).fillna(0.0)
+                             for t, d in data.items()})
+        pos = (w * 0.5).shift(1).fillna(0.0)
+        assert np.allclose(res["gross"], (pos * rets).sum(axis=1))
+
+    def test_missing_weight_columns_filled_zero(self):
+        data = make_panel()
+        w = pd.DataFrame({"AAA": 1.0}, index=data["AAA"].index)
+        res = backtest.backtest_multi(data, w, MULTI_SPEC)
+        assert res["pos"].iloc[1] == pytest.approx(1.0)  # BBB column filled 0, AAA scaled 1.0
+
+    def test_carry_costs_not_modeled_exit(self):
+        data = make_panel()
+        spec = {**MULTI_SPEC, "costs": {"commission_bps": 10, "slippage_bps": 10,
+                                        "borrow_bps_annual": 50}}
+        w = pd.DataFrame(0.5, index=data["AAA"].index, columns=["AAA", "BBB"])
+        with pytest.raises(SystemExit, match="carry costs"):
+            backtest.backtest_multi(data, w, spec)
+
+
+class TestLoadPanel:
+    def test_outer_join_ffill_and_master_index(self, tmp_path):
+        a = make_panel(60, 0, ("AAA",))["AAA"]
+        b = make_panel(30, 1, ("BBB",))["BBB"]  # starts 30 bars later
+        b.index = b.index + pd.tseries.offsets.BusinessDay(30)
+        a.to_csv(tmp_path / "AAA.csv")
+        b.to_csv(tmp_path / "BBB.csv")
+        # punch a mid-series hole in AAA's calendar on a date BBB trades, so
+        # the row survives the outer join and only AAA is untraded there
+        a_no_gap = a.drop(index=a.index[35])
+        a_no_gap.to_csv(tmp_path / "AAA.csv")
+        data, master = backtest.load_panel(["AAA", "BBB"], None, None, tmp_path)
+        assert list(data) == ["AAA", "BBB"]
+        assert data["AAA"].index.equals(master)
+        assert data["BBB"].index.equals(master)
+        assert master.equals(a.index)
+        assert data["BBB"]["close"].iloc[:30].isna().all()  # before first quote: NaN
+        assert data["BBB"]["close"].iloc[30:].notna().all()
+        # closes are ffilled across untraded rows; other columns may stay NaN
+        assert data["AAA"]["close"].notna().all()
+        assert pd.isna(data["AAA"]["open"].iloc[35])
+
+
 class TestMetrics:
     def test_full_output_keys(self):
         df = make_prices()
@@ -339,6 +438,70 @@ class TestEndToEndRun:
         assert out["in_sample"]["n_bars"] + out["out_of_sample"]["n_bars"] == 80
 
 
+class TestMultiUniverseRun:
+    def make_env(self, tmp_path, monkeypatch, signal_body):
+        """Two cached tickers + a strategy module + a full valid spec."""
+        monkeypatch.setattr(backtest, "ROOT", tmp_path)
+
+        prices = tmp_path / "data" / "prices"
+        prices.mkdir(parents=True)
+        for t, df in make_panel(60).items():
+            df.to_csv(prices / f"{t}.csv")
+
+        strategies = tmp_path / "strategies"
+        strategies.mkdir()
+        (strategies / "multi-ser.py").write_text(
+            "import pandas as pd\n"
+            "def signal(data, **params):\n"
+            "    idx = next(iter(data.values())).index\n"
+            f"{signal_body}"
+        )
+
+        spec = {
+            "meta": {
+                "slug": "multi-ser", "title": "Multi Test",
+                "source": "test", "url": "https://a.com", "posted": "2020-03-02",
+                "claim": "equal weight two assets",
+                "author_evidence": {"headline_metrics": "n/a", "sample": "n/a",
+                                    "costs_included": False},
+            },
+            "data": {"universe": ["AAA", "BBB"], "start": "2020-01-01"},
+            "signal": {"definition": "equal weight", "lag_bars": 1},
+            "rules": {"max_leverage": 1.0},
+            "costs": {"commission_bps": 5, "slippage_bps": 5},
+            "validation": {
+                "cost_sweep_bps": [0, 50],
+                "param_sweep": None,
+                "multiple_testing": {"n_tested_so_far": 3},
+                "min_trades": 1,
+            },
+            "verdict": {"status": "unknown", "reason": None},
+            "ambiguities": [],
+        }
+        spec_path = tmp_path / "spec.yaml"
+        spec_path.write_text(yaml.safe_dump(spec))
+        return spec_path
+
+    def test_multi_universe_requires_dataframe_weights(self, tmp_path, monkeypatch):
+        sp = self.make_env(
+            tmp_path, monkeypatch,
+            "    return pd.Series(1.0, index=idx)\n")
+        with pytest.raises(SystemExit, match="weights DataFrame"):
+            backtest.run(sp, n_trials=1)
+
+    def test_multi_universe_end_to_end(self, tmp_path, monkeypatch):
+        sp = self.make_env(
+            tmp_path, monkeypatch,
+            "    return pd.DataFrame(1.0 / len(data), index=idx, columns=list(data))\n")
+        out = backtest.run(sp, n_trials=1)
+        assert out["full"]["n_bars"] == 60
+        assert "benchmark_bh" in out
+        assert out["benchmark_bh"]["n_bars"] == 60
+        assert set(out["cost_sweep"]) == {"0bps", "50bps"}
+        assert isinstance(out["auto_flags"], list)
+        assert out["in_sample"]["n_bars"] + out["out_of_sample"]["n_bars"] == 60
+
+
 class TestLoadStrategy:
     def test_missing_module_exits(self, tmp_path, monkeypatch):
         monkeypatch.setattr(backtest, "ROOT", tmp_path)
@@ -360,3 +523,54 @@ class TestLoadStrategy:
         (strategies / "ok.py").write_text("def signal(df, **p):\n    return df.close\n")
         mod = backtest.load_strategy("ok")
         assert callable(mod.signal)
+
+
+class TestAppendLeaderboard:
+    def make_spec_and_out(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(backtest, "ROOT", tmp_path)
+        spec = {"verdict": {"status": "WEAKER", "reason": "r"}}
+        df = make_prices()
+        res = backtest.backtest(df, pd.Series(1.0, index=df.index), BASE_SPEC)
+        out = {
+            "slug": "always-in",
+            "full": backtest.metrics(res),
+            "null_test": {"beats_null_95": True},
+            "deflated_sharpe": 0.9,
+            "auto_flags": ["WEAK: does not beat buy-and-hold after costs"],
+        }
+        return spec, out
+
+    def test_appends_one_json_row(self, tmp_path, monkeypatch):
+        spec, out = self.make_spec_and_out(tmp_path, monkeypatch)
+        path = tmp_path / "results" / "leaderboard.jsonl"
+        backtest.append_leaderboard(spec, out, path)
+        rows = backtest.json.loads(path.read_text().splitlines()[0])
+        assert rows["slug"] == "always-in"
+        assert rows["verdict"] == "WEAKER"
+        assert rows["net_sharpe"] == out["full"]["sharpe"]
+        assert rows["deflated_sharpe"] == 0.9
+        assert rows["beats_null_95"] is True
+        assert rows["flags"] == out["auto_flags"]
+        assert "run_at" in rows
+
+    def test_appends_not_overwrites(self, tmp_path, monkeypatch):
+        spec, out = self.make_spec_and_out(tmp_path, monkeypatch)
+        path = tmp_path / "results" / "leaderboard.jsonl"
+        backtest.append_leaderboard(spec, out, path)
+        backtest.append_leaderboard(spec, out, path)
+        assert len(path.read_text().splitlines()) == 2
+
+    def test_creates_results_dir(self, tmp_path, monkeypatch):
+        spec, out = self.make_spec_and_out(tmp_path, monkeypatch)
+        path = backtest.append_leaderboard(spec, out, tmp_path / "results" / "leaderboard.jsonl")
+        assert path.exists()
+
+    def test_missing_verdict_recorded_as_unknown(self, tmp_path, monkeypatch):
+        """A spec without a verdict must still leave its leaderboard row --
+        the expensive backtest already ran by the time this would crash."""
+        spec, out = self.make_spec_and_out(tmp_path, monkeypatch)
+        spec.pop("verdict")
+        path = tmp_path / "results" / "leaderboard.jsonl"
+        backtest.append_leaderboard(spec, out, path)
+        row = backtest.json.loads(path.read_text().splitlines()[0])
+        assert row["verdict"] == "unknown"
