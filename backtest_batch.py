@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -27,17 +29,43 @@ FAILED = ROOT / "results" / "failed.jsonl"
 DEFAULT_TIMEOUT = 600
 
 
-def run_one(spec: Path, timeout: int) -> dict:
-    """One spec in an isolated process. Never raises."""
-    cmd = ["uv", "run", "python", "backtest.py", str(spec)]
+def _backtest_cmd(spec: Path) -> list[str]:
+    return ["uv", "run", "python", "backtest.py", str(spec)]
+
+
+def _kill_group(pid: int) -> None:
+    """SIGKILL the whole process group -- the `uv` wrapper and its python
+    child. Killing only the wrapper would leave the child running, free to
+    write a leaderboard row for a spec the batch just recorded as failed."""
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, cwd=ROOT)
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass  # already gone, or re-parented before we got to it
+
+
+def run_one(spec: Path, timeout: int) -> dict:
+    """One spec in an isolated process. Expected failures (timeout, nonzero
+    exit, missing interpreter) come back as {"spec", "error"} dicts.
+
+    The child runs in its own process group (start_new_session) so the
+    timeout kill reaches the `uv` wrapper's python grandchild, not just the
+    wrapper itself.
+    """
+    try:
+        proc = subprocess.Popen(_backtest_cmd(spec), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                cwd=ROOT, start_new_session=True)
+    except OSError as exc:
+        return {"spec": str(spec), "error": f"could not launch backtest.py: {exc}"}
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        _kill_group(proc.pid)
+        proc.communicate()  # reap the killed group
         return {"spec": str(spec), "error": f"timed out after {timeout}s"}
     if proc.returncode != 0:
-        return {"spec": str(spec), "error": f"exit {proc.returncode}: {proc.stderr[-300:]}"}
-    return {"spec": str(spec), "output": proc.stdout}
+        return {"spec": str(spec), "error": f"exit {proc.returncode}: {stderr[-300:]}"}
+    return {"spec": str(spec), "output": stdout}
 
 
 def already_run(leaderboard: Path) -> set[str]:
@@ -63,19 +91,28 @@ def main_with(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     done = already_run(LEADERBOARD)
+    ok = failed = 0
     specs = []
     for path in sorted(args.specs.glob("*.yaml")):
-        slug = yaml.safe_load(path.read_text())["meta"]["slug"]
+        try:
+            slug = yaml.safe_load(path.read_text())["meta"]["slug"]
+        except (yaml.YAMLError, KeyError, TypeError, AttributeError, OSError) as exc:
+            failed += 1
+            record_failure({"spec": str(path), "error": f"bad spec: {exc}"}, FAILED)
+            print(f"FAIL    bad spec: {str(exc)[:60]:<60}  {path}")
+            continue
         if slug not in done:
             specs.append(path)
     if not specs:
-        print(f"nothing to backtest in {args.specs} -- all specs have leaderboard rows")
-        return 1
+        if failed:
+            print(f"\n{ok} ok, {failed} failed (see {FAILED.relative_to(ROOT)})")
+        else:
+            print(f"nothing to backtest in {args.specs} -- all specs have leaderboard rows")
+        return 0
 
     print(f"backtesting {len(specs)} specs "
           f"({args.jobs} at a time, {args.timeout}s cap each)\n")
 
-    ok = failed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {pool.submit(run_one, s, args.timeout): s for s in specs}
         for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
