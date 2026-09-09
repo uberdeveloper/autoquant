@@ -158,6 +158,14 @@ class TestBacktestMulti:
         res = backtest.backtest_multi(data, w, MULTI_SPEC)
         assert res["pos"].iloc[1] == pytest.approx(1.0)  # BBB column filled 0, AAA scaled 1.0
 
+    def test_carry_costs_not_modeled_exit(self):
+        data = make_panel()
+        spec = {**MULTI_SPEC, "costs": {"commission_bps": 10, "slippage_bps": 10,
+                                        "borrow_bps_annual": 50}}
+        w = pd.DataFrame(0.5, index=data["AAA"].index, columns=["AAA", "BBB"])
+        with pytest.raises(SystemExit, match="carry costs"):
+            backtest.backtest_multi(data, w, spec)
+
 
 class TestLoadPanel:
     def test_outer_join_ffill_and_master_index(self, tmp_path):
@@ -166,6 +174,10 @@ class TestLoadPanel:
         b.index = b.index + pd.tseries.offsets.BusinessDay(30)
         a.to_csv(tmp_path / "AAA.csv")
         b.to_csv(tmp_path / "BBB.csv")
+        # punch a mid-series hole in AAA's calendar on a date BBB trades, so
+        # the row survives the outer join and only AAA is untraded there
+        a_no_gap = a.drop(index=a.index[35])
+        a_no_gap.to_csv(tmp_path / "AAA.csv")
         data, master = backtest.load_panel(["AAA", "BBB"], None, None, tmp_path)
         assert list(data) == ["AAA", "BBB"]
         assert data["AAA"].index.equals(master)
@@ -173,6 +185,9 @@ class TestLoadPanel:
         assert master.equals(a.index)
         assert data["BBB"]["close"].iloc[:30].isna().all()  # before first quote: NaN
         assert data["BBB"]["close"].iloc[30:].notna().all()
+        # closes are ffilled across untraded rows; other columns may stay NaN
+        assert data["AAA"]["close"].notna().all()
+        assert pd.isna(data["AAA"]["open"].iloc[35])
 
 
 class TestMetrics:
