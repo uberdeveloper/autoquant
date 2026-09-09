@@ -34,7 +34,7 @@ STRATEGIES = ROOT / "strategies"
 
 CLI_TIMEOUT = 600
 
-CONTRACT = """\
+CONTRACT_SINGLE = """\
 Write a Python module implementing the strategy spec below.
 
 Contract:
@@ -50,6 +50,24 @@ Contract:
 - Output ONLY Python source. No markdown fences, no prose.
 """
 
+CONTRACT_MULTI = """\
+Write a Python module implementing the strategy spec below.
+
+Contract:
+- define exactly: def signal(data: dict[str, pd.DataFrame], **params) -> pd.DataFrame
+- `data` maps every ticker in the spec's data.universe to an OHLCV frame
+  (lowercase open/high/low/close/volume, shared DatetimeIndex; closes are
+  ffilled but are NaN before the ticker's first quote — weight 0 there).
+- Return a weights DataFrame: same index as the frames,
+  exactly one column per ticker, float target weights. Rows may be all 0.0 (cash).
+- The harness lags the weights per column and applies costs -- do NOT shift,
+  do NOT compute returns or costs.
+- Vectorised pandas/numpy only; no network, no file I/O, no prints.
+- Every parameter the spec's signal section uses must be a keyword argument
+  with a default.
+- Output ONLY Python source. No markdown fences, no prose.
+"""
+
 
 def strip_fence(text: str) -> str:
     text = text.strip()
@@ -58,7 +76,12 @@ def strip_fence(text: str) -> str:
 
 
 def build_prompt(spec: dict) -> str:
-    return (f"{CONTRACT}\n---\n\nStrategy spec:\n\n```yaml\n"
+    try:
+        multi = len(spec["data"]["universe"]) > 1
+    except (KeyError, TypeError):
+        multi = False  # universe missing/malformed: the single contract is the safe default
+    contract = CONTRACT_MULTI if multi else CONTRACT_SINGLE
+    return (f"{contract}\n---\n\nStrategy spec:\n\n```yaml\n"
             f"{yaml.safe_dump(spec, sort_keys=False)}```\n")
 
 
@@ -70,8 +93,13 @@ def smoke_frame(n: int = 30) -> pd.DataFrame:
          "low": close * 0.99, "close": close, "volume": 1e6}, index=idx)
 
 
-def smoke_test(path: Path, params: dict) -> str | None:
-    """Import the module and call signal on synthetic data. None = OK."""
+def smoke_test(path: Path, params: dict, multi: bool = False) -> str | None:
+    """Import the module and call signal on synthetic data. None = OK.
+
+    multi=False: params are the signal kwargs; one synthetic frame is passed.
+    multi=True: params maps ticker -> OHLCV frame and is passed as `data`
+    itself; no signal kwargs are forwarded, which is safe because the multi
+    contract requires every parameter to have a default."""
     name = f"strategies.{path.stem}"
     spec_ = importlib.util.spec_from_file_location(
         name, path,
@@ -81,10 +109,25 @@ def smoke_test(path: Path, params: dict) -> str | None:
         spec_.loader.exec_module(mod)
         if not hasattr(mod, "signal"):
             return "defines no signal(df, **params)"
-        df = smoke_frame()
-        out = mod.signal(df, **params)
+        if multi:
+            df = params
+            out = mod.signal(df)
+        else:
+            df = smoke_frame()
+            out = mod.signal(df, **params)
     except Exception as exc:  # generated code -- any failure is a codegen failure
         return f"{type(exc).__name__}: {exc}"
+    if multi:
+        if not isinstance(out, pd.DataFrame):
+            return "signal did not return a pd.DataFrame (one column per ticker)"
+        if set(out.columns) != set(df):
+            return "weight columns do not match the universe"
+        if not out.index.equals(next(iter(df.values())).index):
+            return "weights index does not match data index"
+        finite = np.isfinite(pd.to_numeric(out.stack(), errors="coerce"))
+        if not finite.all():
+            return "weights contained non-finite values"
+        return None
     if not isinstance(out, pd.Series):
         return "signal did not return a pd.Series"
     if not out.index.equals(df.index):
@@ -151,7 +194,11 @@ def publish(result: dict, spec: dict, strategies_dir: Path) -> str:
 
     params = {k: v for k, v in spec.get("signal", {}).items()
               if k not in ("definition", "lag_bars")}
-    err = smoke_test(tmp, params)
+    universe = list((spec.get("data") or {}).get("universe") or [])
+    if len(universe) > 1:
+        err = smoke_test(tmp, {t: smoke_frame() for t in universe}, multi=True)
+    else:
+        err = smoke_test(tmp, params)
     if err:
         tmp.unlink()  # a module that fails smoke is removed, never published
         _write_atomic(strategies_dir / f"{slug}.error",

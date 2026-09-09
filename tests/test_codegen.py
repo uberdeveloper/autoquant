@@ -106,6 +106,62 @@ VALID_MODULE = (
 )
 
 
+MULTI_SPEC = {"meta": {"slug": "m"}, "data": {"universe": ["AAA", "BBB"]},
+              "signal": {"definition": "d"}}
+
+
+class TestMultiContract:
+    def write_module(self, tmp_path, source, name="m"):
+        path = tmp_path / "strategies"
+        path.mkdir(exist_ok=True)
+        f = path / f"{name}.py"
+        f.write_text(source)
+        return f
+
+    def test_multi_universe_prompt_uses_multi_contract(self):
+        prompt = codegen.build_prompt(MULTI_SPEC)
+        assert "dict[str, pd.DataFrame]" in prompt
+        assert "one column per ticker" in prompt
+
+    def test_single_universe_prompt_keeps_single_contract(self):
+        spec = {"meta": {"slug": "s"}, "data": {"universe": ["SPY"]},
+                "signal": {"definition": "d"}}
+        prompt = codegen.build_prompt(spec)
+        assert "def signal(df: pd.DataFrame" in prompt
+
+    def test_multi_smoke_accepts_weights_frame(self, tmp_path):
+        f = self.write_module(tmp_path, (
+            "import pandas as pd\n"
+            "def signal(data, **params):\n"
+            "    idx = next(iter(data.values())).index\n"
+            "    return pd.DataFrame(1.0 / len(data), index=idx, columns=list(data))\n"
+        ))
+        params = {"AAA": codegen.smoke_frame(), "BBB": codegen.smoke_frame()}
+        assert codegen.smoke_test(f, params, multi=True) is None
+
+    def test_multi_smoke_rejects_series_output(self, tmp_path):
+        f = self.write_module(tmp_path, (
+            "import pandas as pd\n"
+            "def signal(data, **params):\n"
+            "    idx = next(iter(data.values())).index\n"
+            "    return pd.Series(1.0, index=idx)\n"
+        ))
+        params = {"AAA": codegen.smoke_frame(), "BBB": codegen.smoke_frame()}
+        err = codegen.smoke_test(f, params, multi=True)
+        assert err is not None and "DataFrame" in err
+
+    def test_multi_smoke_rejects_wrong_columns(self, tmp_path):
+        f = self.write_module(tmp_path, (
+            "import pandas as pd\n"
+            "def signal(data, **params):\n"
+            "    idx = next(iter(data.values())).index\n"
+            "    return pd.DataFrame(0.5, index=idx, columns=['AAA', 'ZZZ'])\n"
+        ))
+        params = {"AAA": codegen.smoke_frame(), "BBB": codegen.smoke_frame()}
+        err = codegen.smoke_test(f, params, multi=True)
+        assert err is not None and "columns" in err and "universe" in err
+
+
 def cli_stub(stdout, returncode=0):
     def fake_run(*a, **k):
         class Proc:
