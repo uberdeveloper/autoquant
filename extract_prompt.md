@@ -7,8 +7,10 @@ Convert one already-triaged article into a reproducible strategy specification. 
 The input is one article record and its full text:
 
 ```json
-{"title":"...","source":"...","url":"...","posted":"YYYY-MM-DD","text":"full extracted article text"}
+{"slug":"...","title":"...","source":"...","url":"...","posted":"YYYY-MM-DD","text":"full extracted article text"}
 ```
+
+Set meta.slug to exactly the slug from this record, copied verbatim — never derive or re-format it from the title.
 
 Use the article text as evidence. The triage score is a routing decision, not evidence for the specification.
 
@@ -65,7 +67,7 @@ If the article has no deterministic rule after careful reading, do **not** produ
 
 ```yaml
 meta:
-  slug: "derived-from-title"
+  slug: "the slug from the input record, verbatim"
   url: "article-url"
   posted: YYYY-MM-DD
 verdict:

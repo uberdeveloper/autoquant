@@ -49,14 +49,21 @@ def parse_spec(text: str) -> dict:
     return doc
 
 
-def validate_spec(doc: dict) -> list[str]:
+def validate_spec(doc: dict, expected_slug: str) -> list[str]:
     """Structural checks every extracted spec must pass. [] = good.
 
     Defensive against type-violating replies: parse_spec only guarantees a
     dict, so every section introspected here gets an isinstance check and a
     malformed section becomes a validation error, never a crash.
+    expected_slug is the article's precomputed slug (the spec filename);
+    a mismatched meta.slug would make codegen reject the spec permanently.
     """
     errors: list[str] = []
+
+    meta = doc.get("meta")
+    if not isinstance(meta, dict) or meta.get("slug") != expected_slug:
+        errors.append(
+            f"meta.slug must equal the article slug ({expected_slug})")
 
     verdict = doc.get("verdict")
     if isinstance(verdict, dict) and verdict.get("status") == "UNTESTABLE":
@@ -109,8 +116,8 @@ def validate_spec(doc: dict) -> list[str]:
 def build_prompt(rubric: str, row: dict, body: str) -> str:
     if len(body) > MAX_ARTICLE_CHARS:
         body = body[:MAX_ARTICLE_CHARS] + "\n\n[...truncated for length...]"
-    payload = {"title": row["title"], "source": row["source"], "url": row["url"],
-               "posted": row["posted"], "text": body}
+    payload = {"slug": row["slug"], "title": row["title"], "source": row["source"],
+               "url": row["url"], "posted": row["posted"], "text": body}
     return (
         f"{rubric}\n\n"
         "---\n\nHere is the article to extract. Output YAML only -- no "
@@ -138,7 +145,7 @@ def extract_one(row: dict, rubric: str, model: str | None) -> dict:
     except (ValueError, yaml.YAMLError) as exc:
         return {"url": row["url"], "error": f"unparseable YAML: {exc}"[:300]}
 
-    errors = validate_spec(spec)
+    errors = validate_spec(spec, row["slug"])
     if errors:
         return {"url": row["url"], "error": "invalid spec: " + "; ".join(errors)}
     return {"url": row["url"], "spec": spec}

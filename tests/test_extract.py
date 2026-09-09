@@ -1,6 +1,8 @@
 """Tests for extract.py — spec parsing, validation, publishing."""
 from __future__ import annotations
 
+import json
+
 import pytest
 import yaml
 
@@ -45,45 +47,70 @@ class TestParseSpec:
 
 class TestValidateSpec:
     def test_valid_spec_has_no_errors(self):
-        assert extract.validate_spec(VALID_SPEC) == []
+        assert extract.validate_spec(VALID_SPEC, "test-slug") == []
 
     def test_missing_section_reported(self):
         doc = {k: v for k, v in VALID_SPEC.items() if k != "costs"}
-        errors = extract.validate_spec(doc)
+        errors = extract.validate_spec(doc, "test-slug")
         assert any("costs" in e for e in errors)
 
     def test_zero_costs_rejected(self):
         doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
         doc["costs"] = {"commission_bps": 0, "slippage_bps": 0}
-        assert any("costs" in e for e in extract.validate_spec(doc))
+        assert any("costs" in e for e in extract.validate_spec(doc, "test-slug"))
 
     def test_zero_lag_rejected(self):
         doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
         doc["signal"]["lag_bars"] = 0
-        assert any("lag_bars" in e for e in extract.validate_spec(doc))
+        assert any("lag_bars" in e for e in extract.validate_spec(doc, "test-slug"))
 
     def test_empty_ambiguities_rejected(self):
         doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
         doc["ambiguities"] = []
-        assert any("ambiguities" in e for e in extract.validate_spec(doc))
+        assert any("ambiguities" in e for e in extract.validate_spec(doc, "test-slug"))
 
     def test_oos_start_must_equal_posted(self):
         doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
         doc["validation"]["oos_start"] = "2020-01-01"
-        assert any("oos_start" in e for e in extract.validate_spec(doc))
+        assert any("oos_start" in e for e in extract.validate_spec(doc, "test-slug"))
+
+    def test_matching_slug_accepted(self):
+        assert extract.validate_spec(VALID_SPEC, "test-slug") == []
+
+    def test_mismatched_slug_rejected(self):
+        doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
+        errors = extract.validate_spec(doc, "different-slug")
+        assert any("slug" in e for e in errors)
 
     def test_untestable_needs_only_reason(self):
         doc = {"meta": {"slug": "x", "url": "u", "posted": "2026-08-09"},
                "verdict": {"status": "UNTESTABLE", "reason": "no deterministic rule"}}
-        assert extract.validate_spec(doc) == []
+        assert extract.validate_spec(doc, "x") == []
+
+    def test_untestable_mismatched_slug_rejected(self):
+        doc = {"meta": {"slug": "x", "url": "u", "posted": "2026-08-09"},
+               "verdict": {"status": "UNTESTABLE", "reason": "no deterministic rule"}}
+        assert any("slug" in e for e in extract.validate_spec(doc, "other"))
 
     def test_untestable_without_reason_rejected(self):
         doc = {"meta": {"slug": "x"}, "verdict": {"status": "UNTESTABLE"}}
-        assert any("reason" in e for e in extract.validate_spec(doc))
+        assert any("reason" in e for e in extract.validate_spec(doc, "x"))
 
     def test_scalar_verdict_rejected_not_crash(self):
-        errors = extract.validate_spec({"verdict": "UNTESTABLE"})
+        errors = extract.validate_spec({"verdict": "UNTESTABLE"}, "x")
         assert any("verdict" in e for e in errors)
+
+
+class TestBuildPrompt:
+    ROW = {"title": "T", "source": "S", "url": "https://a.com/x",
+           "posted": "2026-08-09", "slug": "test-slug"}
+
+    def test_payload_includes_row_slug(self):
+        """The row's precomputed slug must be in the payload so the model can
+        echo it verbatim -- a re-derived slug never matches the filename."""
+        prompt = extract.build_prompt("RUBRIC", self.ROW, "body text")
+        payload = json.loads(prompt.rsplit("\n\n", 1)[-1])
+        assert payload["slug"] == "test-slug"
 
 
 class TestExtractOne:
