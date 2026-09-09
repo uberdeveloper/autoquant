@@ -110,6 +110,15 @@ def validate_spec(doc: dict, expected_slug: str) -> list[str]:
         errors.append("ambiguities must not be empty")
     if validation.get("oos_start") != meta.get("posted"):
         errors.append("validation.oos_start must equal meta.posted")
+
+    data = doc.get("data")
+    uni = data.get("universe") if isinstance(data, dict) else None
+    if not (isinstance(uni, list) and uni
+            and all(isinstance(t, str) and re.fullmatch(r"[A-Z0-9\-\.\^=]{1,12}", t)
+                    for t in uni)):
+        errors.append("data.universe must be an explicit list of Yahoo-format tickers "
+                      "(e.g. [SPY, BTC-USD]) — rule-based universes are unsupported; "
+                      "mark the article UNTESTABLE instead")
     return errors
 
 

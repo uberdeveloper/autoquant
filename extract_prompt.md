@@ -24,6 +24,7 @@ Work through the article in this order before writing YAML:
 4. Set safe defaults only for missing details, then record each such decision in ambiguities with alternatives and materiality.
 5. Check for lookahead, survivorship, unavailable data, fitted parameters, and a mismatch between the author's universe and the available data.
 6. Populate every required template field. Use YAML null only where the template permits an unknown or unavailable value.
+7. data.universe must be an explicit list of Yahoo Finance tickers, in Yahoo notation (BTC → BTC-USD, SPX → ^GSPC). If the article's universe is a rule, a screen, or anything you cannot write as explicit tickers, mark the article UNTESTABLE.
 
 ## Evidence and ambiguity rules
 
