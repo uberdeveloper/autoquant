@@ -401,3 +401,13 @@ class TestAppendLeaderboard:
         spec, out = self.make_spec_and_out(tmp_path, monkeypatch)
         path = backtest.append_leaderboard(spec, out, tmp_path / "results" / "leaderboard.jsonl")
         assert path.exists()
+
+    def test_missing_verdict_recorded_as_unknown(self, tmp_path, monkeypatch):
+        """A spec without a verdict must still leave its leaderboard row --
+        the expensive backtest already ran by the time this would crash."""
+        spec, out = self.make_spec_and_out(tmp_path, monkeypatch)
+        spec.pop("verdict")
+        path = tmp_path / "results" / "leaderboard.jsonl"
+        backtest.append_leaderboard(spec, out, path)
+        row = backtest.json.loads(path.read_text().splitlines()[0])
+        assert row["verdict"] == "unknown"

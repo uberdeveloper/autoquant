@@ -345,7 +345,12 @@ def write_report(spec_path: Path, out: dict) -> Path:
 def append_leaderboard(spec: dict, out: dict, path: Path | None = None) -> Path:
     """One row per completed run — the leaderboard that feeds the
     deflated-Sharpe n_tested_so_far count. Append-only; backtest_batch.py
-    treats an existing row as "already done"."""
+    treats an existing row as "already done".
+
+    A missing verdict is recorded as "unknown" rather than crashing: by the
+    time this runs, the backtest is finished and the report is written —
+    losing the row here would lose the whole run.
+    """
     path = path or (ROOT / "results" / "leaderboard.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -356,7 +361,7 @@ def append_leaderboard(spec: dict, out: dict, path: Path | None = None) -> Path:
         commit = ""
     row = {
         "slug": out["slug"],
-        "verdict": spec["verdict"]["status"],
+        "verdict": (spec.get("verdict") or {}).get("status") or "unknown",
         "net_sharpe": out["full"]["sharpe"],
         "deflated_sharpe": out["deflated_sharpe"],
         "beats_null_95": out["null_test"].get("beats_null_95"),
