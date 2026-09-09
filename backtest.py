@@ -57,9 +57,10 @@ def load_prices(ticker: str, start, end, cache_dir: Path) -> pd.DataFrame:
 
 
 def load_panel(tickers: list[str], start, end, cache_dir: Path):
-    """Load every ticker, outer-join calendars, ffill closes, reindex all
-    frames to the shared master index. Frames before a ticker's first quote
-    stay NaN — weights there must be 0 and the module decides."""
+    """Load every ticker, outer-join calendars, and forward-fill each close
+    over the shared master index. A close survives untraded rows on the
+    master (its other columns keep NaN there), but stays NaN before the
+    ticker's first quote — weights there must be 0 and the module decides."""
     raw = {t: load_prices(t, None, None, cache_dir) for t in tickers}
     closes = pd.concat({t: df["close"] for t, df in raw.items()}, axis=1).ffill()
     master = closes.dropna(how="all").index
@@ -67,7 +68,10 @@ def load_panel(tickers: list[str], start, end, cache_dir: Path):
         master = master[master >= pd.Timestamp(start)]
     if end:
         master = master[master <= pd.Timestamp(end)]
-    return {t: df.reindex(master) for t, df in raw.items()}, master
+    frames = {t: df.reindex(master) for t, df in raw.items()}
+    for t in frames:
+        frames[t]["close"] = closes[t].reindex(master)
+    return frames, master
 
 
 # ---------------------------------------------------------------- backtest
@@ -114,8 +118,16 @@ def backtest_multi(data: dict[str, pd.DataFrame], weights: pd.DataFrame,
     pos = total weight, asset_ret = the portfolio's return source (gross/pos),
     cost = per-asset turnover * per-side bps. Carry (borrow/financing) is not
     modeled here; every current spec carries 0. The lag is applied per column —
-    the no-lookahead invariant is identical to the single-asset path."""
+    the no-lookahead invariant is identical to the single-asset path.
+
+    Precondition: all frames in `data` share one DatetimeIndex (load_panel
+    guarantees it). Weight columns not in `data` are dropped; weight rows
+    absent from the index are treated as 0."""
     rules, costs = spec["rules"], spec["costs"]
+    if costs.get("borrow_bps_annual", 0) or costs.get("financing_bps_annual", 0):
+        sys.exit("carry costs (borrow/financing) are not modeled for multi-asset "
+                 "universes; set borrow_bps_annual/financing_bps_annual to 0 or "
+                 "run a single-asset spec")
     lag = int(spec["signal"].get("lag_bars", 1))
     master = next(iter(data.values())).index
 
