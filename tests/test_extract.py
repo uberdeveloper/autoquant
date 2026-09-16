@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 import extract
+import llm
 
 
 VALID_SPEC = {
@@ -151,7 +152,7 @@ class TestExtractOne:
 
             return Proc()
 
-        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
         result = extract.extract_one(self.ROW, "RUBRIC", None)
         assert result["spec"]["meta"]["slug"] == "test-slug"
         assert "opencode" in recorded["cmd"]
@@ -169,7 +170,7 @@ class TestExtractOne:
                 stderr = ""
             return Proc()
 
-        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
         result = extract.extract_one(self.ROW, "RUBRIC", None)
         assert "error" in result
 
@@ -187,7 +188,7 @@ class TestExtractOne:
                 stderr = ""
             return Proc()
 
-        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
         result = extract.extract_one(self.ROW, "RUBRIC", None)
         assert "invalid spec" in result["error"]
         assert "lag_bars" in result["error"]
@@ -207,7 +208,7 @@ class TestExtractOne:
                 stderr = ""
             return Proc()
 
-        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
         extract.extract_one(self.ROW, "RUBRIC", "claude-sonnet-4-6")
         assert "--model" in seen["cmd"]
 
@@ -217,9 +218,9 @@ class TestExtractOne:
         monkeypatch.setattr(extract, "ROOT", tmp_path)
 
         def fake_run(*a, **k):
-            raise extract.subprocess.TimeoutExpired(cmd="claude", timeout=600)
+            raise llm.subprocess.TimeoutExpired(cmd="opencode", timeout=600)
 
-        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
         result = extract.extract_one(self.ROW, "RUBRIC", None)
         assert "timed out" in result["error"]
 
@@ -236,7 +237,7 @@ class TestExtractOne:
 
             return Proc()
 
-        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
         result = extract.extract_one(self.ROW, "RUBRIC", None)
         assert "opencode exited 1" in result["error"]
 
@@ -253,7 +254,7 @@ class TestExtractOne:
 
             return Proc()
 
-        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
         result = extract.extract_one(self.ROW, "RUBRIC", None)
         assert "invalid spec" in result["error"]
 
@@ -272,9 +273,40 @@ class TestExtractOne:
 
             return Proc()
 
-        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
         result = extract.extract_one(self.ROW, "RUBRIC", None)
         assert ("spec" in result) != ("error" in result)  # outcome, not exception
+
+    def test_llm_error_becomes_error_row(self, tmp_path, monkeypatch):
+        page = tmp_path / "p.md"
+        page.write_text("---\n\nbody\n")
+        monkeypatch.setattr(extract, "ROOT", tmp_path)
+
+        def fake_complete(prompt, **k):
+            raise llm.LLMError("`claude` CLI not found on PATH")
+
+        monkeypatch.setattr(extract.llm, "complete", fake_complete)
+        result = extract.extract_one(self.ROW, "RUBRIC", None)
+        assert result == {"url": self.ROW["url"],
+                          "error": "`claude` CLI not found on PATH"}
+
+    def test_model_and_extra_forwarded(self, tmp_path, monkeypatch):
+        page = tmp_path / "p.md"
+        page.write_text("---\n\nbody\n")
+        monkeypatch.setattr(extract, "ROOT", tmp_path)
+        seen = {}
+
+        def fake_complete(prompt, *, model=None, extra=None, timeout=600):
+            seen["model"] = model
+            seen["extra"] = list(extra or [])
+            seen["timeout"] = timeout
+            return yaml.safe_dump(VALID_SPEC)
+
+        monkeypatch.setattr(extract.llm, "complete", fake_complete)
+        extract.extract_one(self.ROW, "RUBRIC", "sonnet", ["--max-turns", "1"])
+        assert seen["model"] == "sonnet"
+        assert seen["extra"] == ["--max-turns", "1"]
+        assert seen["timeout"] == extract.CLI_TIMEOUT
 
 
 class TestPublish:
@@ -382,7 +414,8 @@ class TestMain:
 
             return Proc()
 
-        monkeypatch.setattr(extract.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
+        monkeypatch.setattr(extract.llm, "preflight", lambda: None)
 
         assert extract.main_with(["--jobs", "1"]) == 0
         assert (tmp_path / "specs" / "test-slug.yaml").exists()
@@ -391,3 +424,11 @@ class TestMain:
         # resume: a second run finds nothing to do and makes zero CLI calls
         assert extract.main_with(["--jobs", "1"]) == 0
         assert len(calls) == 1
+
+    def test_exits_when_preflight_fails(self, monkeypatch):
+        def boom():
+            raise llm.LLMError("`claude` CLI not found on PATH")
+
+        monkeypatch.setattr(extract.llm, "preflight", boom)
+        with pytest.raises(SystemExit, match="not found on PATH"):
+            extract.main_with([])

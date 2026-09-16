@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Stage [4] EXTRACT -- convert one triaged article into a strategy spec.
 
-Runs extract_prompt.md over every triaged article via the `opencode` CLI
-in headless mode (`opencode run`). A valid reply is published
+Runs extract_prompt.md over every triaged article via the LLM CLI configured
+in llm.py (default: `opencode run`). A valid reply is published
 to specs/<slug>.yaml. An UNTESTABLE reply writes specs/<slug>.untestable; an
 invalid reply writes specs/<slug>.error. Nothing is deleted.
 
@@ -18,8 +18,9 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import llm
 import re
-import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -135,22 +136,20 @@ def build_prompt(rubric: str, row: dict, body: str) -> str:
     )
 
 
-def extract_one(row: dict, rubric: str, model: str | None) -> dict:
-    """One opencode run call -> {"url", "spec"} or {"url", "error"}."""
+def extract_one(row: dict, rubric: str, model: str | None,
+                extra: list[str] | None = None) -> dict:
+    """One LLM call -> {"url", "spec"} or {"url", "error"}."""
     page = ROOT / row["page"]
-    cmd = ["opencode", "run"] + (["--model", model] if model else [])
     prompt = build_prompt(rubric, row, strip_body(page))
 
     try:
-        proc = subprocess.run(cmd, input=prompt, capture_output=True,
-                              text=True, timeout=CLI_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return {"url": row["url"], "error": f"opencode CLI timed out after {CLI_TIMEOUT}s"}
-    if proc.returncode != 0:
-        return {"url": row["url"], "error": f"opencode exited {proc.returncode}: {proc.stderr[:200]}"}
+        reply = llm.complete(prompt, model=model, extra=extra,
+                             timeout=CLI_TIMEOUT)
+    except llm.LLMError as exc:
+        return {"url": row["url"], "error": str(exc)}
 
     try:
-        spec = parse_spec(proc.stdout)
+        spec = parse_spec(reply)
     except (ValueError, yaml.YAMLError) as exc:
         return {"url": row["url"], "error": f"unparseable YAML: {exc}"[:300]}
 
@@ -204,11 +203,18 @@ def pending(rows: list[dict], specs_dir: Path, retry: bool) -> list[dict]:
 def main_with(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="0 = no limit")
-    ap.add_argument("--jobs", type=int, default=2, help="concurrent claude calls")
+    ap.add_argument("--jobs", type=int, default=2, help="concurrent LLM calls")
     ap.add_argument("--model", default=None, help="override the model")
+    ap.add_argument("--llm-arg", action="append", default=[], metavar="ARG",
+                    help="extra argument passed through to the LLM CLI (repeatable)")
     ap.add_argument("--respec", action="store_true",
                     help="also retry slugs with a specs/<slug>.error marker")
     args = ap.parse_args(argv)
+
+    try:
+        llm.preflight()
+    except llm.LLMError as exc:
+        sys.exit(f"error: {exc}")
 
     rubric = PROMPT.read_text()
     rows = load(ARTICLES)  # read-only -- publish() never rewrites this file
@@ -224,7 +230,8 @@ def main_with(argv: list[str] | None = None) -> int:
     stages: dict[str, int] = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(extract_one, r, rubric, args.model): r for r in todo}
+        futures = {pool.submit(extract_one, r, rubric, args.model,
+                               args.llm_arg): r for r in todo}
         for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
             result = fut.result()
             row = by_url[result["url"]]
