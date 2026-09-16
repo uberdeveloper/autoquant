@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Stage [3] TRIAGE -- score each fetched article on "can this be backtested?"
 
-Runs triage_prompt.md over every fetched article via the `claude` CLI in
-headless mode (-p), so it uses your existing Claude Code auth -- no
-ANTHROPIC_API_KEY, no `ant auth login`.
+Runs triage_prompt.md over every fetched article via the `opencode` CLI
+in headless mode (`opencode run`, prompt piped on stdin), so it uses your
+existing opencode auth.
 
 Routing follows the rubric in triage_prompt.md:
   score 4-5  -> triaged     (proceeds to EXTRACT)
@@ -90,16 +90,16 @@ def parse_json(text: str) -> dict:
 
 def score_one(row: dict, rubric: str, model: str | None) -> dict:
     page = ROOT / row["page"]
-    cmd = ["claude", "-p"] + (["--model", model] if model else [])
+    cmd = ["opencode", "run"] + (["--model", model] if model else [])
     prompt = build_prompt(rubric, row, strip_body(page))
 
     try:
         proc = subprocess.run(cmd, input=prompt, capture_output=True,
                               text=True, timeout=CLI_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return {"url": row["url"], "error": f"claude CLI timed out after {CLI_TIMEOUT}s"}
+        return {"url": row["url"], "error": f"opencode CLI timed out after {CLI_TIMEOUT}s"}
     if proc.returncode != 0:
-        return {"url": row["url"], "error": f"claude exited {proc.returncode}: {proc.stderr[:200]}"}
+        return {"url": row["url"], "error": f"opencode exited {proc.returncode}: {proc.stderr[:200]}"}
 
     try:
         result = parse_json(proc.stdout)

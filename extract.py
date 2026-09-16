@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Stage [4] EXTRACT -- convert one triaged article into a strategy spec.
 
-Runs extract_prompt.md over every triaged article via the `claude` CLI in
-headless mode (-p), reusing your Claude Code auth. A valid reply is published
+Runs extract_prompt.md over every triaged article via the `opencode` CLI
+in headless mode (`opencode run`). A valid reply is published
 to specs/<slug>.yaml. An UNTESTABLE reply writes specs/<slug>.untestable; an
 invalid reply writes specs/<slug>.error. Nothing is deleted.
 
@@ -136,18 +136,18 @@ def build_prompt(rubric: str, row: dict, body: str) -> str:
 
 
 def extract_one(row: dict, rubric: str, model: str | None) -> dict:
-    """One claude -p call -> {"url", "spec"} or {"url", "error"}."""
+    """One opencode run call -> {"url", "spec"} or {"url", "error"}."""
     page = ROOT / row["page"]
-    cmd = ["claude", "-p"] + (["--model", model] if model else [])
+    cmd = ["opencode", "run"] + (["--model", model] if model else [])
     prompt = build_prompt(rubric, row, strip_body(page))
 
     try:
         proc = subprocess.run(cmd, input=prompt, capture_output=True,
                               text=True, timeout=CLI_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return {"url": row["url"], "error": f"claude CLI timed out after {CLI_TIMEOUT}s"}
+        return {"url": row["url"], "error": f"opencode CLI timed out after {CLI_TIMEOUT}s"}
     if proc.returncode != 0:
-        return {"url": row["url"], "error": f"claude exited {proc.returncode}: {proc.stderr[:200]}"}
+        return {"url": row["url"], "error": f"opencode exited {proc.returncode}: {proc.stderr[:200]}"}
 
     try:
         spec = parse_spec(proc.stdout)

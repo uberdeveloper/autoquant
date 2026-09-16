@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stage [5] CODEGEN -- write strategies/<slug>.py from specs/<slug>.yaml.
 
-One claude -p call per spec, then an OFFLINE smoke test: the module must
+One `opencode run` call per spec, then an OFFLINE smoke test: the module must
 import and signal(df, **params) must return a finite, index-aligned series
 on synthetic data. The backtest harness lags the signal -- generated code
 must not shift it, and the prompt says so explicitly.
@@ -154,7 +154,7 @@ def pending_specs(specs_dir: Path, strategies_dir: Path, retry: bool) -> list[Pa
 
 
 def generate_one(spec_path: Path, model: str | None) -> dict:
-    """One claude -p call -> {"slug", "source"} or {"slug", "error"}."""
+    """One opencode run call -> {"slug", "source"} or {"slug", "error"}."""
     try:
         spec = yaml.safe_load(spec_path.read_text())
         slug = spec["meta"]["slug"]
@@ -163,15 +163,15 @@ def generate_one(spec_path: Path, model: str | None) -> dict:
     if slug != spec_path.stem:
         return {"slug": spec_path.stem,
                 "error": "meta.slug does not match spec filename"}
-    cmd = ["claude", "-p"] + (["--model", model] if model else [])
+    cmd = ["opencode", "run"] + (["--model", model] if model else [])
 
     try:
         proc = subprocess.run(cmd, input=build_prompt(spec), capture_output=True,
                               text=True, timeout=CLI_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return {"slug": slug, "error": f"claude CLI timed out after {CLI_TIMEOUT}s"}
+        return {"slug": slug, "error": f"opencode CLI timed out after {CLI_TIMEOUT}s"}
     if proc.returncode != 0:
-        return {"slug": slug, "error": f"claude exited {proc.returncode}: {proc.stderr[:200]}"}
+        return {"slug": slug, "error": f"opencode exited {proc.returncode}: {proc.stderr[:200]}"}
     source = strip_fence(proc.stdout)
     if not source:
         return {"slug": slug, "error": "empty reply"}

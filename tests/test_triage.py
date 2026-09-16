@@ -92,7 +92,7 @@ class TestScoreOne:
         assert result["score"] == 4
         assert result["url"] == row["url"]
         assert result["slug"] == row["slug"]
-        assert "claude" in recorded["cmd"]
+        assert "opencode" in recorded["cmd"]
         assert "--model" not in recorded["cmd"]
 
     def test_timeout_returns_error_row(self, tmp_path, monkeypatch):

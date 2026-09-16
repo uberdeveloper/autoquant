@@ -154,7 +154,7 @@ class TestExtractOne:
         monkeypatch.setattr(extract.subprocess, "run", fake_run)
         result = extract.extract_one(self.ROW, "RUBRIC", None)
         assert result["spec"]["meta"]["slug"] == "test-slug"
-        assert "claude" in recorded["cmd"]
+        assert "opencode" in recorded["cmd"]
         assert "RUBRIC" in recorded["input"]
 
     def test_invalid_yaml_returns_error(self, tmp_path, monkeypatch):
@@ -238,7 +238,7 @@ class TestExtractOne:
 
         monkeypatch.setattr(extract.subprocess, "run", fake_run)
         result = extract.extract_one(self.ROW, "RUBRIC", None)
-        assert "claude exited 1" in result["error"]
+        assert "opencode exited 1" in result["error"]
 
     def test_scalar_verdict_becomes_error_not_crash(self, tmp_path, monkeypatch):
         page = tmp_path / "p.md"
