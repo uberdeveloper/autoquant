@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+import llm
 import triage
 
 
@@ -87,7 +88,7 @@ class TestScoreOne:
             return Proc()
 
         monkeypatch.setattr(triage, "ROOT", tmp_path)
-        monkeypatch.setattr(triage.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
         result = triage.score_one(row, "RUBRIC", None)
         assert result["score"] == 4
         assert result["url"] == row["url"]
@@ -101,9 +102,50 @@ class TestScoreOne:
         page.write_text("---\n\nbody\n")
 
         def fake_run(*a, **k):
-            raise triage.subprocess.TimeoutExpired(cmd="claude", timeout=300)
+            raise llm.subprocess.TimeoutExpired(cmd="opencode", timeout=300)
 
         monkeypatch.setattr(triage, "ROOT", tmp_path)
-        monkeypatch.setattr(triage.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
         result = triage.score_one(row, "RUBRIC", None)
         assert "timed out" in result["error"]
+
+    def test_llm_error_becomes_error_row(self, tmp_path, monkeypatch):
+        row = dict(ROW, page="p.md")
+        page = tmp_path / "p.md"
+        page.write_text("---\n\nbody\n")
+        monkeypatch.setattr(triage, "ROOT", tmp_path)
+
+        def fake_complete(prompt, **k):
+            raise llm.LLMError("`claude` CLI not found on PATH")
+
+        monkeypatch.setattr(triage.llm, "complete", fake_complete)
+        result = triage.score_one(row, "RUBRIC", None)
+        assert result == {"url": row["url"],
+                          "error": "`claude` CLI not found on PATH"}
+
+    def test_extra_args_forwarded(self, tmp_path, monkeypatch):
+        row = dict(ROW, page="p.md")
+        page = tmp_path / "p.md"
+        page.write_text("---\n\nbody\n")
+        monkeypatch.setattr(triage, "ROOT", tmp_path)
+        seen = {}
+
+        def fake_complete(prompt, *, model=None, extra=None, timeout=300):
+            seen["model"] = model
+            seen["extra"] = list(extra or [])
+            seen["timeout"] = timeout
+            return json.dumps({"score": 4})
+
+        monkeypatch.setattr(triage.llm, "complete", fake_complete)
+        triage.score_one(row, "RUBRIC", "sonnet", ["--output-format", "json"])
+        assert seen["model"] == "sonnet"
+        assert seen["extra"] == ["--output-format", "json"]
+        assert seen["timeout"] == triage.CLI_TIMEOUT
+
+    def test_main_exits_when_preflight_fails(self, monkeypatch):
+        def boom():
+            raise llm.LLMError("`claude` CLI not found on PATH")
+
+        monkeypatch.setattr(triage.llm, "preflight", boom)
+        with pytest.raises(SystemExit, match="not found on PATH"):
+            triage.main_with([])
