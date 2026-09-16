@@ -31,3 +31,26 @@ Every stage is independent and resumable: re-running any command skips work
 that already has its output artifact. Specs, strategy code, and
 `results/leaderboard.jsonl` are committed; page caches, price caches, and
 full reports stay out of Git.
+
+### Swapping the LLM provider
+
+The three LLM stages (triage, extract, codegen) go through `llm.py`. The
+provider command defaults to `opencode run` and is overridden with env
+vars -- no code edits:
+
+```bash
+AUTOQUANT_LLM_CMD="claude -p" python3 triage.py
+AUTOQUANT_LLM_CMD="crush run -q {model}" python3 extract.py --model sonnet
+```
+
+- `AUTOQUANT_LLM_CMD` -- shlex-split command template; a `{model}` placeholder
+  is optional (without it, `--model <model>` is appended when `--model` is set).
+- `AUTOQUANT_LLM_EXTRA_ARGS` -- extra CLI arguments, shlex-split, appended to
+  every call.
+- `--llm-arg ARG` -- per-invocation extra argument, repeatable, supported by
+  `triage.py`, `extract.py`, and `codegen.py`.
+
+Any CLI that reads the prompt on stdin (or as a positional arg) and prints the
+completion on stdout works; the stages' fence-stripping parsers tolerate
+formatting differences. A missing CLI is caught at startup by a preflight
+check -- a batch never crashes mid-run because the binary disappeared.

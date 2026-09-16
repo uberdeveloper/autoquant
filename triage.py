@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Stage [3] TRIAGE -- score each fetched article on "can this be backtested?"
 
-Runs triage_prompt.md over every fetched article via the `claude` CLI in
-headless mode (-p), so it uses your existing Claude Code auth -- no
-ANTHROPIC_API_KEY, no `ant auth login`.
+Runs triage_prompt.md over every fetched article via the LLM CLI configured
+in llm.py (default: `opencode run`). Swap the provider with AUTOQUANT_LLM_CMD.
 
 Routing follows the rubric in triage_prompt.md:
   score 4-5  -> triaged     (proceeds to EXTRACT)
@@ -23,8 +22,8 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import llm
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -88,21 +87,19 @@ def parse_json(text: str) -> dict:
     raise ValueError(f"no JSON object in reply: {text[:200]!r}")
 
 
-def score_one(row: dict, rubric: str, model: str | None) -> dict:
+def score_one(row: dict, rubric: str, model: str | None,
+              extra: list[str] | None = None) -> dict:
     page = ROOT / row["page"]
-    cmd = ["claude", "-p"] + (["--model", model] if model else [])
     prompt = build_prompt(rubric, row, strip_body(page))
 
     try:
-        proc = subprocess.run(cmd, input=prompt, capture_output=True,
-                              text=True, timeout=CLI_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return {"url": row["url"], "error": f"claude CLI timed out after {CLI_TIMEOUT}s"}
-    if proc.returncode != 0:
-        return {"url": row["url"], "error": f"claude exited {proc.returncode}: {proc.stderr[:200]}"}
+        reply = llm.complete(prompt, model=model, extra=extra,
+                             timeout=CLI_TIMEOUT)
+    except llm.LLMError as exc:
+        return {"url": row["url"], "error": str(exc)}
 
     try:
-        result = parse_json(proc.stdout)
+        result = parse_json(reply)
     except (ValueError, json.JSONDecodeError) as exc:
         return {"url": row["url"], "error": f"unparseable reply: {exc}"[:300]}
 
@@ -114,15 +111,22 @@ def score_one(row: dict, rubric: str, model: str | None) -> dict:
     return result
 
 
-def main() -> int:
+def main_with(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="0 = no limit")
-    ap.add_argument("--jobs", type=int, default=4, help="concurrent claude calls")
+    ap.add_argument("--jobs", type=int, default=4, help="concurrent LLM calls")
     ap.add_argument("--model", default=None,
                     help="override the model (default: your session's)")
+    ap.add_argument("--llm-arg", action="append", default=[], metavar="ARG",
+                    help="extra argument passed through to the LLM CLI (repeatable)")
     ap.add_argument("--rescore", action="store_true",
                     help="re-score articles already in triage.jsonl")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+
+    try:
+        llm.preflight()
+    except llm.LLMError as exc:
+        sys.exit(f"error: {exc}")
 
     rubric = PROMPT.read_text()
     rows = load(ARTICLES)
@@ -141,7 +145,8 @@ def main() -> int:
     results: list[dict] = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(score_one, r, rubric, args.model): r for r in todo}
+        futures = {pool.submit(score_one, r, rubric, args.model,
+                               args.llm_arg): r for r in todo}
         for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
             res = fut.result()
             results.append(res)
@@ -171,6 +176,10 @@ def main() -> int:
     print("\nstages:", ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     print(f"scores -> {TRIAGE.relative_to(ROOT)}")
     return 0
+
+
+def main() -> int:
+    return main_with()
 
 
 if __name__ == "__main__":

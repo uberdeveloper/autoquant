@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import codegen
+import llm
+import pytest
 
 
 class TestSmokeFrame:
@@ -187,14 +189,14 @@ def write_spec(tmp_path, slug="test-slug"):
 class TestGenerateOne:
     def test_valid_reply_returns_source(self, tmp_path, monkeypatch):
         spec_path = write_spec(tmp_path)
-        monkeypatch.setattr(codegen.subprocess, "run", cli_stub(VALID_MODULE))
+        monkeypatch.setattr(llm.subprocess, "run", cli_stub(VALID_MODULE))
         result = codegen.generate_one(spec_path, None)
         assert result["slug"] == "test-slug"
         assert "def signal" in result["source"]
 
     def test_cli_failure_returns_error(self, tmp_path, monkeypatch):
         spec_path = write_spec(tmp_path)
-        monkeypatch.setattr(codegen.subprocess, "run", cli_stub("", returncode=1))
+        monkeypatch.setattr(llm.subprocess, "run", cli_stub("", returncode=1))
         result = codegen.generate_one(spec_path, None)
         assert result["slug"] == "test-slug"
         assert "error" in result
@@ -203,7 +205,7 @@ class TestGenerateOne:
         spec_path = tmp_path / "specs" / "bad-slug.yaml"
         spec_path.parent.mkdir(parents=True)
         spec_path.write_text("not: [valid")  # unclosed flow sequence
-        monkeypatch.setattr(codegen.subprocess, "run", cli_stub(VALID_MODULE))
+        monkeypatch.setattr(llm.subprocess, "run", cli_stub(VALID_MODULE))
         result = codegen.generate_one(spec_path, None)
         assert "error" in result
         assert result["slug"] == "bad-slug"
@@ -212,10 +214,37 @@ class TestGenerateOne:
         spec_path = tmp_path / "specs" / "mis.yaml"
         spec_path.parent.mkdir(parents=True)
         spec_path.write_text("meta:\n  slug: other-name\n")
-        monkeypatch.setattr(codegen.subprocess, "run", cli_stub(VALID_MODULE))
+        monkeypatch.setattr(llm.subprocess, "run", cli_stub(VALID_MODULE))
         result = codegen.generate_one(spec_path, None)
         assert "error" in result
         assert "match" in result["error"]
+
+    def test_llm_error_becomes_error_result(self, tmp_path, monkeypatch):
+        spec_path = write_spec(tmp_path)
+
+        def fake_complete(prompt, **k):
+            raise llm.LLMError("`claude` CLI not found on PATH")
+
+        monkeypatch.setattr(codegen.llm, "complete", fake_complete)
+        result = codegen.generate_one(spec_path, None)
+        assert result["slug"] == "test-slug"
+        assert "not found on PATH" in result["error"]
+
+    def test_model_and_extra_forwarded(self, tmp_path, monkeypatch):
+        spec_path = write_spec(tmp_path)
+        seen = {}
+
+        def fake_complete(prompt, *, model=None, extra=None, timeout=600):
+            seen["model"] = model
+            seen["extra"] = list(extra or [])
+            seen["timeout"] = timeout
+            return VALID_MODULE
+
+        monkeypatch.setattr(codegen.llm, "complete", fake_complete)
+        codegen.generate_one(spec_path, "sonnet", ["--max-turns", "1"])
+        assert seen["model"] == "sonnet"
+        assert seen["extra"] == ["--max-turns", "1"]
+        assert seen["timeout"] == codegen.CLI_TIMEOUT
 
 
 class TestPublish:
@@ -306,7 +335,8 @@ class TestMain:
 
             return Proc()
 
-        monkeypatch.setattr(codegen.subprocess, "run", fake_run)
+        monkeypatch.setattr(llm.subprocess, "run", fake_run)
+        monkeypatch.setattr(codegen.llm, "preflight", lambda: None)
 
         assert codegen.main_with(["--jobs", "1"]) == 0
         assert (strategies / "a.py").exists()
@@ -325,9 +355,18 @@ class TestMain:
         monkeypatch.setattr(codegen, "ROOT", tmp_path)
         monkeypatch.setattr(codegen, "SPECS", specs)
         monkeypatch.setattr(codegen, "STRATEGIES", strategies)
-        monkeypatch.setattr(codegen.subprocess, "run", cli_stub(VALID_MODULE))
+        monkeypatch.setattr(llm.subprocess, "run", cli_stub(VALID_MODULE))
+        monkeypatch.setattr(codegen.llm, "preflight", lambda: None)
 
         assert codegen.main_with(["--jobs", "1"]) == 0  # no raise, batch survives
         marker = strategies / "bad.error"
         assert marker.exists()
         assert "unreadable spec" in marker.read_text()
+
+    def test_exits_when_preflight_fails(self, monkeypatch):
+        def boom():
+            raise llm.LLMError("`claude` CLI not found on PATH")
+
+        monkeypatch.setattr(codegen.llm, "preflight", boom)
+        with pytest.raises(SystemExit, match="not found on PATH"):
+            codegen.main_with([])
