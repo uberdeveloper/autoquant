@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stage [5] CODEGEN -- write strategies/<slug>.py from specs/<slug>.yaml.
 
-One `opencode run` call per spec, then an OFFLINE smoke test: the module must
+One LLM call per spec via llm.py (default: `opencode run`), then an OFFLINE smoke test: the module must
 import and signal(df, **params) must return a finite, index-aligned series
 on synthetic data. The backtest harness lags the signal -- generated code
 must not shift it, and the prompt says so explicitly.
@@ -20,8 +20,9 @@ import concurrent.futures
 import importlib.machinery
 import importlib.util
 import json
+import llm
 import re
-import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -153,8 +154,9 @@ def pending_specs(specs_dir: Path, strategies_dir: Path, retry: bool) -> list[Pa
     return [p for p in sorted(specs_dir.glob("*.yaml")) if p.stem not in done]
 
 
-def generate_one(spec_path: Path, model: str | None) -> dict:
-    """One opencode run call -> {"slug", "source"} or {"slug", "error"}."""
+def generate_one(spec_path: Path, model: str | None,
+                 extra: list[str] | None = None) -> dict:
+    """One LLM call -> {"slug", "source"} or {"slug", "error"}."""
     try:
         spec = yaml.safe_load(spec_path.read_text())
         slug = spec["meta"]["slug"]
@@ -163,16 +165,13 @@ def generate_one(spec_path: Path, model: str | None) -> dict:
     if slug != spec_path.stem:
         return {"slug": spec_path.stem,
                 "error": "meta.slug does not match spec filename"}
-    cmd = ["opencode", "run"] + (["--model", model] if model else [])
 
     try:
-        proc = subprocess.run(cmd, input=build_prompt(spec), capture_output=True,
-                              text=True, timeout=CLI_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return {"slug": slug, "error": f"opencode CLI timed out after {CLI_TIMEOUT}s"}
-    if proc.returncode != 0:
-        return {"slug": slug, "error": f"opencode exited {proc.returncode}: {proc.stderr[:200]}"}
-    source = strip_fence(proc.stdout)
+        reply = llm.complete(build_prompt(spec), model=model, extra=extra,
+                             timeout=CLI_TIMEOUT)
+    except llm.LLMError as exc:
+        return {"slug": slug, "error": str(exc)}
+    source = strip_fence(reply)
     if not source:
         return {"slug": slug, "error": "empty reply"}
     return {"slug": slug, "source": source}
@@ -212,11 +211,18 @@ def publish(result: dict, spec: dict, strategies_dir: Path) -> str:
 def main_with(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="0 = no limit")
-    ap.add_argument("--jobs", type=int, default=2, help="concurrent claude calls")
+    ap.add_argument("--jobs", type=int, default=2, help="concurrent LLM calls")
     ap.add_argument("--model", default=None, help="override the model")
+    ap.add_argument("--llm-arg", action="append", default=[], metavar="ARG",
+                    help="extra argument passed through to the LLM CLI (repeatable)")
     ap.add_argument("--retry-failed", action="store_true",
                     help="also retry specs with a strategies/<slug>.error marker")
     args = ap.parse_args(argv)
+
+    try:
+        llm.preflight()
+    except llm.LLMError as exc:
+        sys.exit(f"error: {exc}")
 
     todo = pending_specs(SPECS, STRATEGIES, args.retry_failed)
     if args.limit:
@@ -229,7 +235,8 @@ def main_with(argv: list[str] | None = None) -> int:
     stages: dict[str, int] = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(generate_one, p, args.model): p for p in todo}
+        futures = {pool.submit(generate_one, p, args.model,
+                               args.llm_arg): p for p in todo}
         for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
             spec_path = futures[fut]
             try:
