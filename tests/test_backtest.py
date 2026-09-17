@@ -574,3 +574,30 @@ class TestAppendLeaderboard:
         backtest.append_leaderboard(spec, out, path)
         row = backtest.json.loads(path.read_text().splitlines()[0])
         assert row["verdict"] == "unknown"
+
+
+class TestCatalogUniverse:
+    def test_load_prices_dispatches_prefixed_ids_to_catalog(self, tmp_path, monkeypatch):
+        seen = {}
+
+        def fake_load(series_id, start, end):
+            seen["id"], seen["start"], seen["end"] = series_id, start, end
+            idx = pd.DatetimeIndex(["2024-01-02", "2024-01-03"])
+            return pd.DataFrame({"close": [100.0, 101.0]}, index=idx)
+
+        monkeypatch.setattr(backtest.catalog, "load", fake_load)
+
+        df = backtest.load_prices("fred:DGS10", "2024-01-01", None,
+                                  tmp_path / "cache")
+
+        assert seen == {"id": "fred:DGS10", "start": "2024-01-01", "end": None}
+        assert list(df.columns) == ["close"]
+
+    def test_bare_ticker_still_uses_yfinance_path(self, tmp_path, monkeypatch):
+        # a cached data/prices CSV short-circuits before any network
+        cache = tmp_path / "SPY.csv"
+        cache.write_text(",close\n2024-01-02,100.0\n")
+
+        df = backtest.load_prices("SPY", None, None, tmp_path)
+
+        assert len(df) == 1  # legacy path untouched

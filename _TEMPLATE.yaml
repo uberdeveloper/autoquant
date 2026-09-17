@@ -23,7 +23,8 @@ meta:
     costs_included: false              # usually false — note it, it matters
 
 data:
-  universe: [SPY]                      # explicit tickers, or a rule + point-in-time source
+  universe: [SPY]                      # tickers, or catalog ids: fred:DGS10, yahoo:SPY
+                                       # (find them: python3 catalog.py search <query>)
   bar: 1d                              # 1d | 1h | 5m | ...
   fields: [open, high, low, close, volume]
   start: 1993-01-29

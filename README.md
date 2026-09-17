@@ -25,6 +25,7 @@ python3 extract.py                # [4] triaged article -> specs/<slug>.yaml
 python3 codegen.py                # [5] spec -> strategies/<slug>.py (smoke-tested)
 python3 backtest_batch.py         # [6-8] every spec, isolated process, timeout-capped
 uv run python backtest.py specs/<slug>.yaml   # [6-8] single spec + report + leaderboard row
+python3 catalog.py search rates   # find data series across providers (yahoo/fred/stooq)
 ```
 
 Every stage is independent and resumable: re-running any command skips work
@@ -54,3 +55,16 @@ Any CLI that reads the prompt on stdin (or as a positional arg) and prints the
 completion on stdout works; the stages' fence-stripping parsers tolerate
 formatting differences. A missing CLI is caught at startup by a preflight
 check -- a batch never crashes mid-run because the binary disappeared.
+
+### Data catalog
+
+Universe entries can be bare Yahoo tickers (`SPY`) or catalog ids:
+`yahoo:SPY`, `fred:DGS10`, `stooq:spy.us`. Find series with
+`python3 catalog.py search <query>`, inspect one with
+`python3 catalog.py show <id>`, and pre-warm the cache with
+`python3 catalog.py fetch <id>`. The committed seed index is
+`catalog.json`; series cache under `data/catalog/`. If a primary provider
+fails, an entry's declared fallback (usually a Yahoo/Stooq mirror) is used
+automatically. Macro entries note their release lag and whether vintage
+(ALFRED) data exists -- loading current-vintage data for backtests has
+lookahead caveats the spec's `data.caveats` should state.
