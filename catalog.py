@@ -130,9 +130,12 @@ def load(series_id: str, start, end) -> pd.DataFrame:
     else:
         try:
             df = PROVIDERS[source](symbol)
+            if df.empty:
+                # a header-only frame would shadow real data in the cache forever
+                raise ValueError("returned no data")
         except Exception as exc:
             if not entry.get("fallback"):
-                raise
+                raise ValueError(f"{entry['id']}: {exc}") from exc
             print(f"{entry['id']}: {exc} -- falling back to {entry['fallback']}")
             return load(entry["fallback"], start, end)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)

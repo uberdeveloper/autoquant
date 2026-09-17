@@ -140,6 +140,16 @@ class TestLoad:
         with pytest.raises(ValueError, match="not in catalog"):
             catalog.load("fred:NOPE_NOPE", None, None)
 
+    def test_empty_fetch_is_not_cached(self, tmp_path, monkeypatch):
+        # a failed download must not poison the cache with a header-only file
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        self._stub_yahoo(monkeypatch, pd.DataFrame())
+
+        with pytest.raises(ValueError, match="returned no data"):
+            catalog.load("yahoo:SPY", None, None)
+
+        assert not (tmp_path / "yahoo_SPY.csv").exists()
+
 
 class TestMain:
     def test_search_command_prints_hits(self, capsys):
