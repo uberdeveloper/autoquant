@@ -144,12 +144,17 @@ def main_with(argv: list[str] | None = None) -> int:
     by_url = {r["url"]: r for r in rows}
     results: list[dict] = []
 
+    abort = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {pool.submit(score_one, r, rubric, args.model,
                                args.llm_arg): r for r in todo}
         for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
             res = fut.result()
             results.append(res)
+            abort = llm.circuit_break(results)
+            if abort:
+                pool.shutdown(wait=False, cancel_futures=True)
+                break
             row = by_url[res["url"]]
 
             if "error" in res:
@@ -169,6 +174,10 @@ def main_with(argv: list[str] | None = None) -> int:
     fresh = {r["url"] for r in results}
     save(TRIAGE, [r for r in scored if r["url"] not in fresh] + results)
     save(ARTICLES, rows)
+
+    if abort:
+        print(f"\n{abort}")
+        return 1
 
     counts: dict[str, int] = {}
     for r in rows:
