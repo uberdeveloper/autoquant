@@ -432,3 +432,36 @@ class TestMain:
         monkeypatch.setattr(extract.llm, "preflight", boom)
         with pytest.raises(SystemExit, match="not found on PATH"):
             extract.main_with([])
+
+
+class TestMainCircuitBreaker:
+    def test_main_aborts_without_publishing_the_rest(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / "data").mkdir()
+        rows = []
+        for n in range(5):
+            page = tmp_path / "data" / "pages" / f"p{n}.md"
+            page.parent.mkdir(parents=True, exist_ok=True)
+            page.write_text("---\n\nbody\n")
+            rows.append({"url": f"https://a.com/{n}", "title": f"T{n}",
+                         "source": "S", "posted": "2026-08-09",
+                         "slug": f"s{n}", "page": f"data/pages/p{n}.md",
+                         "stage": "triaged"})
+        articles = tmp_path / "data" / "articles.jsonl"
+        articles.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        (tmp_path / "prompt.md").write_text("RUBRIC")
+
+        monkeypatch.setattr(extract, "ROOT", tmp_path)
+        monkeypatch.setattr(extract, "ARTICLES", articles)
+        monkeypatch.setattr(extract, "SPECS", tmp_path / "specs")
+        monkeypatch.setattr(extract, "PROMPT", tmp_path / "prompt.md")
+
+        def fake_complete(prompt, **k):
+            raise llm.LLMError("opencode exited 1: auth expired")
+
+        monkeypatch.setattr(extract.llm, "complete", fake_complete)
+
+        assert extract.main_with(["--jobs", "1", "--limit", "5"]) == 1
+        assert "aborting" in capsys.readouterr().out
+        # only the first K=3 slugs got an .error marker
+        markers = sorted((tmp_path / "specs").glob("*.error"))
+        assert len(markers) == 3
