@@ -1,6 +1,7 @@
 """Tests for catalog.py — series search, resolution, and multi-provider loading."""
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
 import catalog
@@ -39,3 +40,102 @@ class TestParseId:
     def test_resolve_unknown_series_raises(self):
         with pytest.raises(ValueError, match="not in catalog"):
             catalog.resolve("fred:NOPE_NOPE")
+
+
+class TestLoad:
+    def _stub_read_csv(self, monkeypatch, frame_by_url):
+        """Stub pandas.read_csv for URLs only; local cache reads pass through."""
+        calls = []
+        real = pd.read_csv
+
+        def fake_read_csv(url_or_path, *a, **k):
+            path = str(url_or_path)
+            if not path.startswith("http"):
+                return real(url_or_path, *a, **k)  # local cache file
+            calls.append(path)
+            for key, frame in frame_by_url.items():
+                if key in path:
+                    return frame.copy()
+            raise OSError(f"network down for {url_or_path}")
+
+        monkeypatch.setattr(catalog.pd, "read_csv", fake_read_csv)
+        return calls
+
+    def _stub_yahoo(self, monkeypatch, frame):
+        def fake_download(ticker, **k):
+            return frame.copy()
+
+        monkeypatch.setattr(catalog, "_yahoo_download", fake_download)
+
+    def test_fred_maps_value_to_close_and_caches(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        url = ("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10")
+        fred = pd.DataFrame({"observation_date": ["2024-01-02", "2024-01-03"],
+                             "DGS10": ["4.0", "4.1"]})
+        self._stub_read_csv(monkeypatch, {url: fred})
+
+        df = catalog.load("fred:DGS10", None, None)
+
+        assert list(df.columns) == ["close"]
+        assert df["close"].iloc[0] == 4.0        # string -> float
+        assert isinstance(df.index, pd.DatetimeIndex)
+        assert (tmp_path / "fred_DGS10.csv").exists()  # cache written
+
+    def test_cached_read_makes_no_network_call(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        cache = tmp_path / "fred_DGS10.csv"
+        cache.write_text(",close\n2024-01-02,4.0\n2024-01-03,4.1\n")
+        calls = self._stub_read_csv(monkeypatch, {})
+
+        df = catalog.load("fred:DGS10", None, None)
+
+        assert calls == []                        # zero network
+        assert len(df) == 2
+
+    def test_yahoo_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        yf = pd.DataFrame({"Close": [100.0, 101.0],
+                           "Open": [99.0, 100.0],
+                           "High": [101.0, 102.0],
+                           "Low": [98.0, 99.5],
+                           "Volume": [1000, 1100]},
+                          index=pd.DatetimeIndex(["2024-01-02", "2024-01-03"]))
+        self._stub_yahoo(monkeypatch, yf)
+
+        df = catalog.load("yahoo:SPY", None, None)
+
+        assert sorted(df.columns) == ["close", "high", "low", "open", "volume"]
+        assert df["close"].iloc[1] == 101.0
+
+    def test_fallback_used_when_primary_fails(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        # yahoo download raises -> QQQ falls back to stooq
+        def boom(ticker, **k):
+            raise OSError("yahoo down")
+
+        monkeypatch.setattr(catalog, "_yahoo_download", boom)
+        stooq = pd.DataFrame({"Date": ["2024-01-02"], "Open": [99.0],
+                              "High": [101.0], "Low": [98.0], "Close": [100.0],
+                              "Volume": [1000]})
+        url = "https://stooq.com/q/d/l/?s=qqq.us&i=d"
+        calls = self._stub_read_csv(monkeypatch, {url: stooq})
+
+        df = catalog.load("yahoo:QQQ", None, None)
+
+        assert calls and "stooq.com" in calls[0]
+        assert df["close"].iloc[0] == 100.0
+        assert "falling back" in capsys.readouterr().out.lower()
+
+    def test_start_end_filters(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        cache = tmp_path / "fred_DGS10.csv"
+        cache.write_text(",close\n2020-01-01,1.0\n2024-01-01,2.0\n")
+
+        df = catalog.load("fred:DGS10", "2023-01-01", None)
+
+        assert len(df) == 1 and df["close"].iloc[0] == 2.0
+
+    def test_unresolvable_series_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        with pytest.raises(ValueError, match="not in catalog"):
+            catalog.load("fred:NOPE_NOPE", None, None)

@@ -68,3 +68,78 @@ def resolve(series_id: str) -> dict:
         raise ValueError(f"{series_id!r} not in catalog "
                          f"(try: python3 catalog.py search <query>)")
     return entry
+
+
+# ---------------------------------------------------------------- providers
+
+FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
+STOOQ_URL = "https://stooq.com/q/d/l/?s={id}&i=d"
+
+
+def _yahoo_download(ticker: str, **kwargs) -> pd.DataFrame:
+    """Isolated so tests (and future providers) can stub it."""
+    import yfinance
+
+    return yfinance.download(ticker, **kwargs)
+
+
+def _fetch_yahoo(symbol: str) -> pd.DataFrame:
+    df = _yahoo_download(symbol, start="1990-01-01", auto_adjust=True,
+                         progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.columns = [str(c).lower() for c in df.columns]
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    return df
+
+
+def _fetch_fred(series: str) -> pd.DataFrame:
+    raw = pd.read_csv(FRED_URL.format(id=series))
+    date_col = raw.columns[0]
+    raw[date_col] = pd.to_datetime(raw[date_col])
+    df = (raw.set_index(date_col)
+             .rename(columns={series: "close"})
+             .apply(pd.to_numeric, errors="coerce").dropna())
+    df.index.name = None
+    return df[["close"]]
+
+
+def _fetch_stooq(symbol: str) -> pd.DataFrame:
+    raw = pd.read_csv(STOOQ_URL.format(id=symbol))
+    raw.columns = [str(c).strip().lower() for c in raw.columns]
+    raw["date"] = pd.to_datetime(raw["date"])
+    df = raw.set_index("date").apply(pd.to_numeric, errors="coerce").dropna()
+    df.index.name = None
+    return df[["open", "high", "low", "close", "volume"]]
+
+
+PROVIDERS = {"yahoo": _fetch_yahoo, "fred": _fetch_fred, "stooq": _fetch_stooq}
+
+# ---------------------------------------------------------------- loading
+
+def load(series_id: str, start, end) -> pd.DataFrame:
+    """One series, cached, fallback-aware. Normalized frame out:
+    lowercase columns, always with `close`, DatetimeIndex, filtered to
+    [start, end]."""
+    entry = resolve(series_id)
+    source, symbol = parse_id(entry["id"])
+    cache = CACHE_DIR / f"{source}_{re.sub(r'[^A-Za-z0-9]', '_', symbol)}.csv"
+
+    if cache.exists():
+        df = pd.read_csv(cache, index_col=0, parse_dates=True)
+    else:
+        try:
+            df = PROVIDERS[source](symbol)
+        except Exception as exc:
+            if not entry.get("fallback"):
+                raise
+            print(f"{entry['id']}: {exc} -- falling back to {entry['fallback']}")
+            return load(entry["fallback"], start, end)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(cache)
+
+    if start:
+        df = df[df.index >= pd.Timestamp(start)]
+    if end:
+        df = df[df.index <= pd.Timestamp(end)]
+    return df

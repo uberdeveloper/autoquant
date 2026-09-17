@@ -54,6 +54,14 @@
     {"id": "stooq:spy.us", "title": "S&P 500 ETF (SPY) via Stooq", "tags": ["equity", "etf"],
      "frequency": "daily", "coverage_start": "1993-01-29", "vintage_available": false,
      "notes": "Price-only (unadjusted) history; a fallback mirror for yahoo:SPY.",
+     "fallback": null},
+    {"id": "stooq:qqq.us", "title": "Nasdaq-100 ETF (QQQ) via Stooq", "tags": ["equity", "etf"],
+     "frequency": "daily", "coverage_start": "1999-03-10", "vintage_available": false,
+     "notes": "Price-only (unadjusted) history; a fallback mirror for yahoo:QQQ.",
+     "fallback": null},
+    {"id": "stooq:gld.us", "title": "Gold Shares ETF (GLD) via Stooq", "tags": ["commodity", "gold", "etf"],
+     "frequency": "daily", "coverage_start": "2004-11-18", "vintage_available": false,
+     "notes": "Price-only (unadjusted) history; a fallback mirror for yahoo:GLD.",
      "fallback": null}
   ]
 }
