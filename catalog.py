@@ -143,3 +143,62 @@ def load(series_id: str, start, end) -> pd.DataFrame:
     if end:
         df = df[df.index <= pd.Timestamp(end)]
     return df
+
+
+# ---------------------------------------------------------------- cli
+
+def main_with(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_search = sub.add_parser("search", help="search the catalog")
+    p_search.add_argument("query")
+
+    p_show = sub.add_parser("show", help="show one entry's metadata")
+    p_show.add_argument("series_id")
+
+    p_fetch = sub.add_parser("fetch", help="download a series into the local cache")
+    p_fetch.add_argument("series_id")
+    p_fetch.add_argument("--start", default=None)
+    p_fetch.add_argument("--end", default=None)
+
+    args = ap.parse_args(argv)
+
+    if args.cmd == "search":
+        hits = search(args.query)
+        if not hits:
+            print(f"no matches for {args.query!r}")
+            return 0
+        for e in hits:
+            print(f"{e['id']:<18} {e['frequency']:<8} {e['title']}")
+        return 0
+
+    if args.cmd == "show":
+        try:
+            e = resolve(args.series_id)
+        except ValueError as exc:
+            sys.exit(f"error: {exc}")
+        for key in ("id", "title", "tags", "frequency", "coverage_start",
+                    "vintage_available", "notes", "fallback"):
+            print(f"{key:>17}: {e.get(key)}")
+        return 0
+
+    if args.cmd == "fetch":
+        df = load(args.series_id, args.start, args.end)
+        print(f"{args.series_id}: {len(df)} bars cached"
+              f"{f' ({df.index[0].date()} -> {df.index[-1].date()})' if len(df) else ''}")
+        return 0
+    return 1
+
+
+def main() -> int:
+    try:
+        return main_with()
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -139,3 +139,37 @@ class TestLoad:
         monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
         with pytest.raises(ValueError, match="not in catalog"):
             catalog.load("fred:NOPE_NOPE", None, None)
+
+
+class TestMain:
+    def test_search_command_prints_hits(self, capsys):
+        assert catalog.main_with(["search", "treasury"]) == 0
+        out = capsys.readouterr().out
+        assert "fred:DGS10" in out
+
+    def test_search_no_match_exits_zero_with_message(self, capsys):
+        assert catalog.main_with(["search", "zzzznotathing"]) == 0
+        assert "no matches" in capsys.readouterr().out.lower()
+
+    def test_show_prints_entry_details(self, capsys):
+        assert catalog.main_with(["show", "fred:DGS10"]) == 0
+        out = capsys.readouterr().out
+        assert "fred:DGS10" in out and "daily" in out
+
+    def test_show_unknown_series_fails_cleanly(self, capsys):
+        with pytest.raises(SystemExit):
+            catalog.main_with(["show", "fred:NOPE_NOPE"])
+
+    def test_fetch_warms_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        seen = {}
+
+        def fake_load(series_id, start, end):
+            seen["id"], seen["start"], seen["end"] = series_id, start, end
+            return pd.DataFrame({"close": [1.0]},
+                                index=pd.DatetimeIndex(["2024-01-02"]))
+
+        monkeypatch.setattr(catalog, "load", fake_load)
+        assert catalog.main_with(["fetch", "fred:DGS10",
+                                  "--start", "2000-01-01"]) == 0
+        assert seen == {"id": "fred:DGS10", "start": "2000-01-01", "end": None}
