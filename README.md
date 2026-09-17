@@ -54,3 +54,10 @@ Any CLI that reads the prompt on stdin (or as a positional arg) and prints the
 completion on stdout works; the stages' fence-stripping parsers tolerate
 formatting differences. A missing CLI is caught at startup by a preflight
 check -- a batch never crashes mid-run because the binary disappeared.
+
+A batch also has a circuit breaker: if the first 3 completions in a run all
+fail at the CLI level (binary missing, auth expired, timeout), the stage
+aborts with one clear message and keeps the work already completed, instead
+of writing an identical error artifact for every remaining item. Parse and
+validation failures never trip it -- those are per-article, not provider
+outages.
