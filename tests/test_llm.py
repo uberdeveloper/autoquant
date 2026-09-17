@@ -123,3 +123,41 @@ class TestComplete:
         with pytest.raises(llm.LLMError) as excinfo:
             llm.complete("p")
         assert len(str(excinfo.value)) < 250
+
+
+class TestCircuitBreaker:
+    def test_cli_level_errors_classified(self):
+        assert llm.is_cli_error("opencode exited 1: auth expired")
+        assert llm.is_cli_error("`claude` CLI not found on PATH")
+        assert llm.is_cli_error("opencode CLI timed out after 300s")
+
+    def test_stage_level_errors_not_classified(self):
+        assert not llm.is_cli_error("unparseable YAML: while scanning")
+        assert not llm.is_cli_error("invalid spec: missing costs")
+        assert not llm.is_cli_error("unreadable spec: boom")
+        assert not llm.is_cli_error("empty reply")
+        assert not llm.is_cli_error("meta.slug does not match spec filename")
+
+    def test_breaker_quiet_below_k(self):
+        results = [{"error": "opencode exited 1: auth"}]
+        assert llm.circuit_break(results) is None
+
+    def test_breaker_trips_on_k_consecutive_cli_errors(self):
+        results = [{"error": "opencode exited 1: auth"} for _ in range(3)]
+        msg = llm.circuit_break(results)
+        assert msg is not None and "aborting" in msg and "3" in msg
+
+    def test_breaker_spared_by_a_stage_level_error(self):
+        results = [{"error": "opencode exited 1: auth"},
+                   {"error": "unparseable YAML: x"},
+                   {"error": "opencode exited 1: auth"}]
+        assert llm.circuit_break(results) is None
+
+    def test_breaker_ignores_successes(self):
+        results = [{"score": 4}, {"score": 3}, {"error": "opencode exited 1: a"}]
+        assert llm.circuit_break(results) is None
+
+    def test_breaker_k_is_configurable(self):
+        results = [{"error": "opencode exited 1: a"} for _ in range(5)]
+        assert llm.circuit_break(results, k=5) is not None
+        assert llm.circuit_break(results[:4], k=5) is None

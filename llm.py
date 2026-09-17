@@ -20,6 +20,7 @@ into LLMError so a mid-run failure becomes a per-item error, never a crash.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -75,3 +76,35 @@ def complete(prompt: str, model: str | None = None,
     if proc.returncode != 0:
         raise LLMError(f"{argv[0]} exited {proc.returncode}: {proc.stderr[:200]}")
     return proc.stdout
+
+
+CIRCUIT_K = 3  # consecutive CLI-level failures before a batch aborts
+
+_STAGE_LEVEL_PREFIXES = ("unparseable", "invalid spec:", "unreadable spec:",
+                         "empty reply", "meta.slug does not match")
+
+
+def is_cli_error(error: str) -> bool:
+    """True if an error-row string came from the LLM CLI plumbing
+    (missing binary, nonzero exit, timeout) rather than the stage's own
+    reply parsing/validation."""
+    if error.startswith(_STAGE_LEVEL_PREFIXES):
+        return False
+    return ("CLI not found on PATH" in error
+            or "CLI timed out after" in error
+            or bool(re.match(r"^\S+ exited \d+:", error)))
+
+
+def circuit_break(results: list[dict], k: int = CIRCUIT_K) -> str | None:
+    """Abort message if the first k completed results are ALL CLI-level
+    failures -- the provider is down or unauthenticated, and continuing
+    would only write N identical error artifacts. None means keep going."""
+    head = results[:k]
+    if len(head) < k:
+        return None
+    if all("error" in r and is_cli_error(r["error"]) for r in head):
+        first = head[0]["error"]
+        return (f"aborting: first {k} results all failed at the CLI level "
+                f"(first error: {first[:160]}) -- fix the LLM CLI/auth "
+                f"and re-run; completed work is kept")
+    return None
