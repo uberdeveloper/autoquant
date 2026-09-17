@@ -110,24 +110,43 @@ def _fetch_stooq(symbol: str) -> pd.DataFrame:
     raw["date"] = pd.to_datetime(raw["date"])
     df = raw.set_index("date").apply(pd.to_numeric, errors="coerce").dropna()
     df.index.name = None
-    return df[["open", "high", "low", "close", "volume"]]
+    return df.sort_index()[["open", "high", "low", "close", "volume"]]
 
 
 PROVIDERS = {"yahoo": _fetch_yahoo, "fred": _fetch_fred, "stooq": _fetch_stooq}
 
 # ---------------------------------------------------------------- loading
 
+def cache_path(series_id: str) -> Path:
+    source, symbol = parse_id(series_id)
+    return CACHE_DIR / f"{source}_{re.sub(r'[^A-Za-z0-9]', '_', symbol)}.csv"
+
+
+def _write_cache(cache: Path, df: pd.DataFrame) -> None:
+    """Tmp + replace: an interrupted write can never shadow real data."""
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(".csv.tmp")
+    df.to_csv(tmp)
+    tmp.replace(cache)
+
+
 def load(series_id: str, start, end) -> pd.DataFrame:
     """One series, cached, fallback-aware. Normalized frame out:
-    lowercase columns, always with `close`, DatetimeIndex, filtered to
-    [start, end]."""
+    lowercase columns, always with `close`, ascending DatetimeIndex,
+    filtered to [start, end]."""
     entry = resolve(series_id)
     source, symbol = parse_id(entry["id"])
-    cache = CACHE_DIR / f"{source}_{re.sub(r'[^A-Za-z0-9]', '_', symbol)}.csv"
+    cache = cache_path(entry["id"])
 
+    df = None
     if cache.exists():
         df = pd.read_csv(cache, index_col=0, parse_dates=True)
-    else:
+        if df.empty or "close" not in df.columns:
+            cache.unlink()          # truncated/interrupted write -- refetch
+            df = None
+        else:
+            df = df.sort_index()    # self-heal a poisoned (unsorted) cache
+    if df is None:
         try:
             df = PROVIDERS[source](symbol)
             if df.empty:
@@ -138,8 +157,7 @@ def load(series_id: str, start, end) -> pd.DataFrame:
                 raise ValueError(f"{entry['id']}: {exc}") from exc
             print(f"{entry['id']}: {exc} -- falling back to {entry['fallback']}")
             return load(entry["fallback"], start, end)
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache)
+        _write_cache(cache, df)
 
     if start:
         df = df[df.index >= pd.Timestamp(start)]
@@ -166,6 +184,8 @@ def main_with(argv: list[str] | None = None) -> int:
     p_fetch.add_argument("series_id")
     p_fetch.add_argument("--start", default=None)
     p_fetch.add_argument("--end", default=None)
+    p_fetch.add_argument("--refresh", action="store_true",
+                         help="delete any cached copy first and refetch")
 
     args = ap.parse_args(argv)
 
@@ -189,6 +209,8 @@ def main_with(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "fetch":
+        if args.refresh:
+            cache_path(args.series_id).unlink(missing_ok=True)
         df = load(args.series_id, args.start, args.end)
         print(f"{args.series_id}: {len(df)} bars cached"
               f"{f' ({df.index[0].date()} -> {df.index[-1].date()})' if len(df) else ''}")
