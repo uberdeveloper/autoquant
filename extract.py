@@ -228,17 +228,28 @@ def main_with(argv: list[str] | None = None) -> int:
     print(f"extracting {len(todo)} articles ({args.jobs} at a time)\n")
     by_url = {r["url"]: r for r in todo}
     stages: dict[str, int] = {}
+    done: list[dict] = []
 
+    abort = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {pool.submit(extract_one, r, rubric, args.model,
                                args.llm_arg): r for r in todo}
         for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
             result = fut.result()
+            done.append(result)
             row = by_url[result["url"]]
             stage = publish(row, result, SPECS)
             stages[stage] = stages.get(stage, 0) + 1
             mark = "OK  " if stage == "spec" else "FAIL" if stage == "extract_failed" else "SKIP"
             print(f"[{i}/{len(todo)}] {mark}  {stage:<15} {row['title'][:50]}")
+            abort = llm.circuit_break(done)
+            if abort:
+                pool.shutdown(wait=False, cancel_futures=True)
+                break
+
+    if abort:
+        print(f"\n{abort}")
+        return 1
 
     print("\nstages:", ", ".join(f"{k}={v}" for k, v in sorted(stages.items())))
     print(f"specs -> {SPECS.relative_to(ROOT)}/")
