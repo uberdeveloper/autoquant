@@ -370,3 +370,32 @@ class TestMain:
         monkeypatch.setattr(codegen.llm, "preflight", boom)
         with pytest.raises(SystemExit, match="not found on PATH"):
             codegen.main_with([])
+
+
+class TestMainCircuitBreaker:
+    def test_main_aborts_without_coding_the_rest(self, tmp_path, monkeypatch, capsys):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        for n in range(5):
+            (specs / f"s{n}.yaml").write_text(
+                "meta:\n"
+                f"  slug: s{n}\n"
+                "signal:\n"
+                "  definition: d\n"
+                "  lag_bars: 1\n")
+        strategies = tmp_path / "strategies"
+
+        monkeypatch.setattr(codegen, "ROOT", tmp_path)
+        monkeypatch.setattr(codegen, "SPECS", specs)
+        monkeypatch.setattr(codegen, "STRATEGIES", strategies)
+
+        def fake_complete(prompt, **k):
+            raise llm.LLMError("opencode exited 1: auth expired")
+
+        monkeypatch.setattr(codegen.llm, "complete", fake_complete)
+
+        assert codegen.main_with(["--jobs", "1", "--limit", "5"]) == 1
+        assert "aborting" in capsys.readouterr().out
+        # only the first K=3 slugs got an .error marker
+        markers = sorted(strategies.glob("*.error"))
+        assert len(markers) == 3

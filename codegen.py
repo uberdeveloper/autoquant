@@ -233,20 +233,32 @@ def main_with(argv: list[str] | None = None) -> int:
 
     print(f"codegen {len(todo)} specs ({args.jobs} at a time)\n")
     stages: dict[str, int] = {}
+    done: list[dict] = []
 
+    abort = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {pool.submit(generate_one, p, args.model,
                                args.llm_arg): p for p in todo}
         for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+            result = fut.result()
             spec_path = futures[fut]
             try:
                 spec = yaml.safe_load(spec_path.read_text())
             except (yaml.YAMLError, OSError):
                 spec = None  # error results never reach the spec-using path
-            stage = publish(fut.result(), spec, STRATEGIES)
+            stage = publish(result, spec, STRATEGIES)
             stages[stage] = stages.get(stage, 0) + 1
             mark = "OK  " if stage == "coded" else "FAIL"
             print(f"[{i}/{len(todo)}] {mark}  {stage:<15} {spec_path.stem}")
+            done.append(result)
+            abort = llm.circuit_break(done)
+            if abort:
+                pool.shutdown(wait=False, cancel_futures=True)
+                break
+
+    if abort:
+        print(f"\n{abort}")
+        return 1
 
     print("\nstages:", ", ".join(f"{k}={v}" for k, v in sorted(stages.items())))
     print(f"strategies -> {STRATEGIES.relative_to(ROOT)}/")
