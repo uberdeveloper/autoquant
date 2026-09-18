@@ -303,3 +303,39 @@ class TestProvenance:
 
         assert len(flags) == 1
         assert "fallback stooq:qqq.us" in flags[0]
+
+
+class TestFrequency:
+    def test_monthly_series_warns_once_on_load(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        catalog._WARNED.clear()
+        cache = tmp_path / "fred_CPIAUCSL.csv"
+        cache.write_text(",close\n2024-01-01,300.0\n2024-02-01,301.0\n")
+
+        catalog.load("fred:CPIAUCSL", None, None)
+        first = capsys.readouterr().out
+        catalog.load("fred:CPIAUCSL", None, None)
+        second = capsys.readouterr().out
+
+        assert "WARNING" in first and "monthly" in first
+        assert "WARNING" not in second          # once per series, not per call
+
+    def test_daily_series_does_not_warn(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        catalog._WARNED.clear()
+        cache = tmp_path / "fred_DGS10.csv"
+        cache.write_text(",close\n2024-01-02,4.0\n")
+
+        catalog.load("fred:DGS10", None, None)
+
+        assert "WARNING" not in capsys.readouterr().out
+
+    def test_frequency_flags_catch_monthly_in_daily_panel(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        flags = catalog.frequency_flags(["SPY", "fred:CPIAUCSL"], "1d")
+        assert len(flags) == 1
+        assert "fred:CPIAUCSL" in flags[0] and "monthly" in flags[0]
+
+    def test_frequency_flags_pass_matching_bar(self, tmp_path, monkeypatch):
+        flags = catalog.frequency_flags(["SPY"], "1d")
+        assert flags == []

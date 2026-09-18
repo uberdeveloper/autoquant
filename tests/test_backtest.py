@@ -601,3 +601,15 @@ class TestCatalogUniverse:
         df = backtest.load_prices("SPY", None, None, tmp_path)
 
         assert len(df) == 1  # legacy path untouched
+
+
+class TestCatalogFrequencyFlags:
+    def test_monthly_series_adds_warning_flag(self):
+        import copy
+
+        import catalog
+        spec = copy.deepcopy(BASE_SPEC)
+        spec["data"] = {"universe": ["SPY", "fred:CPIAUCSL"], "bar": "1d"}
+        flags = catalog.frequency_flags(spec["data"]["universe"],
+                                        spec["data"].get("bar"))
+        assert any("fred:CPIAUCSL" in f for f in flags)

@@ -130,6 +130,41 @@ def provenance_flags(tickers: list[str]) -> list[str]:
                        f"(mirror data may differ in adjustment)")
     return out
 
+
+_WARNED: set[str] = set()
+
+
+def _warn_frequency(entry: dict) -> None:
+    """Monthly/vintage series released after the period they describe give
+    generated strategies lookahead bias if used directly -- say so loudly,
+    once per series per process."""
+    freq = entry.get("frequency")
+    if freq and freq != "daily" and entry["id"] not in _WARNED:
+        _WARNED.add(entry["id"])
+        print(f"WARNING: {entry['id']} is {freq} -- it is released after the period "
+              f"it describes, so using it directly gives lookahead bias; lag it in "
+              f"the signal or state the caveat in data.caveats")
+
+
+BAR_FREQUENCY = {"1d": "daily", "1wk": "weekly", "1mo": "monthly"}
+
+
+def frequency_flags(tickers: list[str], bar: str | None) -> list[str]:
+    """Spec-level frequency sanity: catalog frequency vs data.bar. A monthly
+    series inside a daily panel creates phantom non-trading bars (diluted
+    Sharpe) and the annualizer still assumes daily bars."""
+    want = BAR_FREQUENCY.get(bar or "1d")
+    if want is None:
+        return []
+    out = []
+    for t in tickers:
+        entry = by_id(t) or by_id(f"yahoo:{t}")
+        if entry and entry.get("frequency") and entry["frequency"] != want:
+            out.append(f"WARN: {entry['id']} is {entry['frequency']} but data.bar is "
+                       f"{bar or '1d'} -- phantom bars dilute Sharpe and the "
+                       f"annualizer assumes daily bars")
+    return out
+
 # ---------------------------------------------------------------- loading
 
 def cache_path(series_id: str) -> Path:
@@ -151,6 +186,7 @@ def load(series_id: str, start, end) -> pd.DataFrame:
     filtered to [start, end]."""
     entry = resolve(series_id)
     source, symbol = parse_id(entry["id"])
+    _warn_frequency(entry)
     cache = cache_path(entry["id"])
 
     df = None

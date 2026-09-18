@@ -331,6 +331,7 @@ def run(spec_path: Path, n_trials: int | None) -> dict:
         n_trials or spec["validation"]["multiple_testing"].get("n_tested_so_far") or 1,
     )
     out["auto_flags"] = auto_flags(spec, out)
+    out["auto_flags"] += catalog.frequency_flags(tickers, spec["data"].get("bar"))
     out["auto_flags"] += catalog.provenance_flags(tickers)
     return out
 
