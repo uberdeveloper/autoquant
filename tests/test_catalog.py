@@ -70,10 +70,16 @@ def _stub_yahoo(monkeypatch, frame):
 class TestLoad:
     def test_fred_maps_value_to_close_and_caches(self, tmp_path, monkeypatch):
         monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
-        url = ("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10")
-        fred = pd.DataFrame({"observation_date": ["2024-01-02", "2024-01-03"],
-                             "DGS10": ["4.0", "4.1"]})
-        _stub_read_csv(monkeypatch, {url: fred})
+
+        class FakeFredReader:
+            def __init__(self, series, start=None, end=None):
+                assert series == "DGS10"
+
+            def read(self):
+                idx = pd.DatetimeIndex(["2024-01-02", "2024-01-03"], name="DATE")
+                return pd.DataFrame({"DGS10": ["4.0", "4.1"]}, index=idx)
+
+        monkeypatch.setattr(catalog, "FredReader", FakeFredReader)
 
         df = catalog.load("fred:DGS10", None, None)
 
@@ -206,13 +212,20 @@ class TestDataIntegrity:
         monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
         cache = tmp_path / "fred_DGS10.csv"
         cache.write_text("close\n")           # truncated/interrupted write
-        url = ("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10")
-        fred = pd.DataFrame({"observation_date": ["2024-01-02"], "DGS10": ["4.0"]})
-        calls = _stub_read_csv(monkeypatch, {url: fred})
+
+        class FakeFredReader:
+            def __init__(self, series, start=None, end=None):
+                pass
+
+            def read(self):
+                idx = pd.DatetimeIndex(["2024-01-02"])
+                return pd.DataFrame({"DGS10": [4.0]}, index=idx)
+
+        monkeypatch.setattr(catalog, "FredReader",
+                            lambda *a, **k: FakeFredReader(*a))
 
         df = catalog.load("fred:DGS10", None, None)
 
-        assert calls                          # network was hit again
         assert len(df) == 1
         assert len(cache.read_text().strip().splitlines()) == 2  # cache rewritten
 
@@ -239,14 +252,22 @@ class TestDataIntegrity:
         monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
         cache = tmp_path / "fred_DGS10.csv"
         cache.write_text(",close\n2024-01-02,4.0\n")
-        url = ("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10")
-        fred = pd.DataFrame({"observation_date": ["2024-01-02", "2024-01-03"],
-                             "DGS10": ["4.0", "4.1"]})
-        calls = _stub_read_csv(monkeypatch, {url: fred})
+
+        class FakeFredReader:
+            def __init__(self, series, start=None, end=None):
+                pass
+
+            def read(self):
+                idx = pd.DatetimeIndex(["2024-01-02", "2024-01-03"])
+                return pd.DataFrame({"DGS10": [4.0, 4.1]}, index=idx)
+
+        fetched = []
+        monkeypatch.setattr(catalog, "FredReader",
+                            lambda *a, **k: (fetched.append(a), FakeFredReader(*a))[1])
 
         assert catalog.main_with(["fetch", "fred:DGS10", "--refresh"]) == 0
 
-        assert calls                          # --refresh bypassed the warm cache
+        assert fetched                        # --refresh bypassed the warm cache
         assert len(pd.read_csv(cache)) == 2
 
 

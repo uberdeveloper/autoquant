@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from pandas_datareader.fred import FredReader
 
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "catalog.json"
@@ -72,7 +73,6 @@ def resolve(series_id: str) -> dict:
 
 # ---------------------------------------------------------------- providers
 
-FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
 STOOQ_URL = "https://stooq.com/q/d/l/?s={id}&i=d"
 
 
@@ -94,14 +94,22 @@ def _fetch_yahoo(symbol: str) -> pd.DataFrame:
 
 
 def _fetch_fred(series: str) -> pd.DataFrame:
-    raw = pd.read_csv(FRED_URL.format(id=series))
-    date_col = raw.columns[0]
-    raw[date_col] = pd.to_datetime(raw[date_col])
-    df = (raw.set_index(date_col)
-             .rename(columns={series: "close"})
-             .apply(pd.to_numeric, errors="coerce").dropna())
+    """Documented macro sources go through pandas-datareader (issue #10 §4):
+    stable endpoints, maintained reader, and one place to add World Bank /
+    OECD / Eurostat later. Yahoo stays yfinance (datareader's Yahoo reader
+    is dead); Stooq stays direct CSV (no datareader reader exists)."""
+    # start=1776-07-04 = "beginning of time" for FRED -- without it the
+    # reader silently truncates to the most recent ~5 years
+    raw = FredReader(series, start="1776-07-04").read()
+    df = raw.apply(pd.to_numeric, errors="coerce").dropna()
+    df.index = pd.to_datetime(df.index)
+    try:
+        df.index = df.index.tz_localize(None)
+    except (TypeError, AttributeError):
+        pass
+    df.columns = ["close"]
     df.index.name = None
-    return df[["close"]]
+    return df
 
 
 def _fetch_stooq(symbol: str) -> pd.DataFrame:
