@@ -384,3 +384,25 @@ class TestUnseededYahoo:
     def test_unknown_source_still_raises(self, tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="unknown source"):
             catalog.load("bogus:XYZ", None, None)
+
+
+class TestMinors:
+    def test_multi_word_search_requires_all_terms(self):
+        hits = catalog.search("treasury yield")
+        ids = {h["id"] for h in hits}
+        assert "fred:DGS10" in ids and "fred:DGS2" in ids
+        assert "yahoo:TLT" not in ids          # has treasury, lacks yield
+
+    def test_normalize_yahoo_dedupes_legacy_block(self):
+        yf = pd.DataFrame({"Close": [100.0], "Open": [99.0], "High": [101.0],
+                           "Low": [98.0], "Volume": [1000]},
+                          index=pd.DatetimeIndex(["2024-01-02"], tz="UTC"))
+
+        df = catalog.normalize_yahoo(yf)
+
+        assert sorted(df.columns) == ["close", "high", "low", "open", "volume"]
+        assert df.index.tz is None
+
+    def test_every_entry_has_a_license(self):
+        for entry in catalog._index()["series"]:
+            assert entry.get("license"), f"{entry['id']} missing license"

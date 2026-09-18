@@ -38,13 +38,14 @@ def by_id(series_id: str) -> dict | None:
 
 
 def search(query: str) -> list[dict]:
-    """Case-insensitive substring match on id, title, and tags."""
-    q = query.lower()
+    """Case-insensitive match on id, title, and tags; multi-word queries
+    require every term to match (AND)."""
+    terms = query.lower().split()
     out = []
     for entry in _index()["series"]:
         hay = " ".join([entry["id"], entry["title"],
                         " ".join(entry["tags"])]).lower()
-        if q in hay:
+        if all(t in hay for t in terms):
             out.append(entry)
     return out
 
@@ -83,14 +84,20 @@ def _yahoo_download(ticker: str, **kwargs) -> pd.DataFrame:
     return yfinance.download(ticker, **kwargs)
 
 
-def _fetch_yahoo(symbol: str) -> pd.DataFrame:
-    df = _yahoo_download(symbol, start="1990-01-01", auto_adjust=True,
-                         progress=False)
+def normalize_yahoo(df: pd.DataFrame) -> pd.DataFrame:
+    """Shared by catalog._fetch_yahoo and backtest.py's legacy bare-ticker
+    path -- one normalization, not two diverging ones."""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.columns = [str(c).lower() for c in df.columns]
     df.index = pd.to_datetime(df.index).tz_localize(None)
     return df
+
+
+def _fetch_yahoo(symbol: str) -> pd.DataFrame:
+    df = _yahoo_download(symbol, start="1990-01-01", auto_adjust=True,
+                         progress=False)
+    return normalize_yahoo(df)
 
 
 def _fetch_fred(series: str) -> pd.DataFrame:
@@ -291,7 +298,7 @@ def main_with(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             sys.exit(f"error: {exc}")
         for key in ("id", "title", "tags", "frequency", "coverage_start",
-                    "vintage_available", "notes", "fallback"):
+                    "vintage_available", "license", "notes", "fallback"):
             print(f"{key:>17}: {e.get(key)}")
         return 0
 

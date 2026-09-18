@@ -52,10 +52,7 @@ def load_prices(ticker: str, start, end, cache_dir: Path) -> pd.DataFrame:
         import yfinance as yf
 
         df = yf.download(ticker, start="1990-01-01", auto_adjust=True, progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [str(c).lower() for c in df.columns]
-        df.index = pd.to_datetime(df.index).tz_localize(None)
+        df = catalog.normalize_yahoo(df)
         df.to_csv(cache)
     if start:
         df = df[df.index >= pd.Timestamp(start)]
