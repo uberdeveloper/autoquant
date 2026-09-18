@@ -143,13 +143,14 @@ class TestLoad:
 
     def test_empty_fetch_is_not_cached(self, tmp_path, monkeypatch):
         # a failed download must not poison the cache with a header-only file
+        # (TLT: no fallback, so the failure surfaces instead of recursing)
         monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
         _stub_yahoo(monkeypatch, pd.DataFrame())
 
         with pytest.raises(ValueError, match="returned no data"):
-            catalog.load("yahoo:SPY", None, None)
+            catalog.load("yahoo:TLT", None, None)
 
-        assert not (tmp_path / "yahoo_SPY.csv").exists()
+        assert not (tmp_path / "yahoo_TLT.csv").exists()
 
 
 class TestMain:
@@ -247,3 +248,58 @@ class TestDataIntegrity:
 
         assert calls                          # --refresh bypassed the warm cache
         assert len(pd.read_csv(cache)) == 2
+
+
+class TestProvenance:
+    def test_primary_fetch_records_source(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(catalog, "PROVENANCE", {})
+        url = ("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10")
+        fred = pd.DataFrame({"observation_date": ["2024-01-02"], "DGS10": ["4.0"]})
+        _stub_read_csv(monkeypatch, {url: fred})
+
+        catalog.load("fred:DGS10", None, None)
+
+        assert catalog.PROVENANCE["fred:DGS10"] == "fred"
+
+    def test_fallback_records_substitution(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(catalog, "PROVENANCE", {})
+
+        def boom(ticker, **k):
+            raise OSError("yahoo down")
+
+        monkeypatch.setattr(catalog, "_yahoo_download", boom)
+        stooq = pd.DataFrame({"Date": ["2024-01-02"], "Open": [99.0],
+                              "High": [101.0], "Low": [98.0], "Close": [100.0],
+                              "Volume": [1000]})
+        url = "https://stooq.com/q/d/l/?s=qqq.us&i=d"
+        _stub_read_csv(monkeypatch, {url: stooq})
+
+        catalog.load("yahoo:QQQ", None, None)
+
+        assert catalog.PROVENANCE["yahoo:QQQ"] == "fallback:stooq:qqq.us"
+
+    def test_spy_declares_stooq_fallback(self):
+        entry = catalog.resolve("yahoo:SPY")
+        assert entry["fallback"] == "stooq:spy.us"   # the index's own note says it is SPY's mirror
+
+    def test_provenance_flags_warn_on_fallback(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(catalog, "PROVENANCE", {})
+
+        def boom(ticker, **k):
+            raise OSError("yahoo down")
+
+        monkeypatch.setattr(catalog, "_yahoo_download", boom)
+        stooq = pd.DataFrame({"Date": ["2024-01-02"], "Open": [99.0],
+                              "High": [101.0], "Low": [98.0], "Close": [100.0],
+                              "Volume": [1000]})
+        url = "https://stooq.com/q/d/l/?s=qqq.us&i=d"
+        _stub_read_csv(monkeypatch, {url: stooq})
+        catalog.load("yahoo:QQQ", None, None)
+
+        flags = catalog.provenance_flags(["yahoo:QQQ", "yahoo:SPY"])
+
+        assert len(flags) == 1
+        assert "fallback stooq:qqq.us" in flags[0]

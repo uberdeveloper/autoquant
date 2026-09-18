@@ -115,6 +115,21 @@ def _fetch_stooq(symbol: str) -> pd.DataFrame:
 
 PROVIDERS = {"yahoo": _fetch_yahoo, "fred": _fetch_fred, "stooq": _fetch_stooq}
 
+# How each requested series was actually served this process: the provider
+# name, "cache", or "fallback:<id>" when a mirror substituted for the
+# primary. Surfaced in reports/leaderboards via provenance_flags().
+PROVENANCE: dict[str, str] = {}
+
+
+def provenance_flags(tickers: list[str]) -> list[str]:
+    out = []
+    for t in tickers:
+        prov = PROVENANCE.get(t)
+        if prov and prov.startswith("fallback:"):
+            out.append(f"WARN: {t} served by fallback {prov.split(':', 1)[1]} "
+                       f"(mirror data may differ in adjustment)")
+    return out
+
 # ---------------------------------------------------------------- loading
 
 def cache_path(series_id: str) -> Path:
@@ -146,6 +161,7 @@ def load(series_id: str, start, end) -> pd.DataFrame:
             df = None
         else:
             df = df.sort_index()    # self-heal a poisoned (unsorted) cache
+            PROVENANCE[entry["id"]] = "cache"
     if df is None:
         try:
             df = PROVIDERS[source](symbol)
@@ -155,9 +171,11 @@ def load(series_id: str, start, end) -> pd.DataFrame:
         except Exception as exc:
             if not entry.get("fallback"):
                 raise ValueError(f"{entry['id']}: {exc}") from exc
+            PROVENANCE[entry["id"]] = f"fallback:{entry['fallback']}"
             print(f"{entry['id']}: {exc} -- falling back to {entry['fallback']}")
             return load(entry["fallback"], start, end)
         _write_cache(cache, df)
+        PROVENANCE[entry["id"]] = source
 
     if start:
         df = df[df.index >= pd.Timestamp(start)]
