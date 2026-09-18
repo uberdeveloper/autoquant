@@ -25,6 +25,7 @@ import re
 import sys
 from pathlib import Path
 
+import catalog
 import numpy as np
 import pandas as pd
 import yaml
@@ -94,10 +95,23 @@ def smoke_frame(n: int = 30) -> pd.DataFrame:
          "low": close * 0.99, "close": close, "volume": 1e6}, index=idx)
 
 
-def smoke_test(path: Path, params: dict, multi: bool = False) -> str | None:
+def smoke_data(series_id: str) -> pd.DataFrame:
+    """Source-shaped smoke frame: close-only for close-only catalog series
+    (FRED), full OHLCV otherwise."""
+    frame = smoke_frame()
+    if catalog.is_close_only(series_id):
+        return frame[["close"]]
+    return frame
+
+
+def smoke_test(path: Path, params: dict, multi: bool = False,
+               df: pd.DataFrame | None = None) -> str | None:
     """Import the module and call signal on synthetic data. None = OK.
 
-    multi=False: params are the signal kwargs; one synthetic frame is passed.
+    multi=False: params are the signal kwargs; `df` defaults to a full
+    OHLCV frame. Pass a source-shaped frame (e.g. close-only for FRED
+    series) so a signal that indexes a column the source never provides
+    fails here instead of crashing in backtest.run().
     multi=True: params maps ticker -> OHLCV frame and is passed as `data`
     itself; no signal kwargs are forwarded, which is safe because the multi
     contract requires every parameter to have a default."""
@@ -111,19 +125,19 @@ def smoke_test(path: Path, params: dict, multi: bool = False) -> str | None:
         if not hasattr(mod, "signal"):
             return "defines no signal(df, **params)"
         if multi:
-            df = params
-            out = mod.signal(df)
+            data = params
+            out = mod.signal(data)
         else:
-            df = smoke_frame()
-            out = mod.signal(df, **params)
+            data = df if df is not None else smoke_frame()
+            out = mod.signal(data, **params)
     except Exception as exc:  # generated code -- any failure is a codegen failure
         return f"{type(exc).__name__}: {exc}"
     if multi:
         if not isinstance(out, pd.DataFrame):
             return "signal did not return a pd.DataFrame (one column per ticker)"
-        if set(out.columns) != set(df):
+        if set(out.columns) != set(data):
             return "weight columns do not match the universe"
-        if not out.index.equals(next(iter(df.values())).index):
+        if not out.index.equals(next(iter(data.values())).index):
             return "weights index does not match data index"
         finite = np.isfinite(pd.to_numeric(out.stack(), errors="coerce"))
         if not finite.all():
@@ -131,7 +145,7 @@ def smoke_test(path: Path, params: dict, multi: bool = False) -> str | None:
         return None
     if not isinstance(out, pd.Series):
         return "signal did not return a pd.Series"
-    if not out.index.equals(df.index):
+    if not out.index.equals(data.index):
         return "signal index does not match df.index"
     if not np.isfinite(pd.to_numeric(out, errors="coerce")).all():
         return "signal returned non-finite values"
@@ -195,9 +209,9 @@ def publish(result: dict, spec: dict, strategies_dir: Path) -> str:
               if k not in ("definition", "lag_bars")}
     universe = list((spec.get("data") or {}).get("universe") or [])
     if len(universe) > 1:
-        err = smoke_test(tmp, {t: smoke_frame() for t in universe}, multi=True)
+        err = smoke_test(tmp, {t: smoke_data(t) for t in universe}, multi=True)
     else:
-        err = smoke_test(tmp, params)
+        err = smoke_test(tmp, params, df=smoke_data(universe[0]) if universe else None)
     if err:
         tmp.unlink()  # a module that fails smoke is removed, never published
         _write_atomic(strategies_dir / f"{slug}.error",

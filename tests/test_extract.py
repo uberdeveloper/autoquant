@@ -432,3 +432,35 @@ class TestMain:
         monkeypatch.setattr(extract.llm, "preflight", boom)
         with pytest.raises(SystemExit, match="not found on PATH"):
             extract.main_with([])
+
+
+class TestCatalogUniverseValidation:
+    def _spec_with_universe(self, universe):
+        doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
+        doc["data"]["universe"] = universe
+        return doc
+
+    def test_fred_id_accepted(self):
+        errs = extract.validate_spec(self._spec_with_universe(["fred:DGS10"]),
+                                     "test-slug")
+        assert not any("universe" in e for e in errs)
+
+    def test_mixed_universe_accepted(self):
+        errs = extract.validate_spec(self._spec_with_universe(["SPY", "fred:DGS10"]),
+                                     "test-slug")
+        assert not any("universe" in e for e in errs)
+
+    def test_unknown_fred_id_rejected(self):
+        errs = extract.validate_spec(self._spec_with_universe(["fred:NOPE_NOPE"]),
+                                     "test-slug")
+        assert any("universe" in e for e in errs)
+
+    def test_unseeded_yahoo_id_accepted(self):
+        errs = extract.validate_spec(self._spec_with_universe(["yahoo:AAPL"]),
+                                     "test-slug")
+        assert not any("universe" in e for e in errs)
+
+    def test_unknown_source_rejected(self):
+        errs = extract.validate_spec(self._spec_with_universe(["bogus:XYZ"]),
+                                     "test-slug")
+        assert any("universe" in e for e in errs)

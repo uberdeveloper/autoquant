@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from pandas_datareader.fred import FredReader
 
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "catalog.json"
@@ -37,13 +38,14 @@ def by_id(series_id: str) -> dict | None:
 
 
 def search(query: str) -> list[dict]:
-    """Case-insensitive substring match on id, title, and tags."""
-    q = query.lower()
+    """Case-insensitive match on id, title, and tags; multi-word queries
+    require every term to match (AND)."""
+    terms = query.lower().split()
     out = []
     for entry in _index()["series"]:
         hay = " ".join([entry["id"], entry["title"],
                         " ".join(entry["tags"])]).lower()
-        if q in hay:
+        if all(t in hay for t in terms):
             out.append(entry)
     return out
 
@@ -72,7 +74,6 @@ def resolve(series_id: str) -> dict:
 
 # ---------------------------------------------------------------- providers
 
-FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
 STOOQ_URL = "https://stooq.com/q/d/l/?s={id}&i=d"
 
 
@@ -83,9 +84,9 @@ def _yahoo_download(ticker: str, **kwargs) -> pd.DataFrame:
     return yfinance.download(ticker, **kwargs)
 
 
-def _fetch_yahoo(symbol: str) -> pd.DataFrame:
-    df = _yahoo_download(symbol, start="1990-01-01", auto_adjust=True,
-                         progress=False)
+def normalize_yahoo(df: pd.DataFrame) -> pd.DataFrame:
+    """Shared by catalog._fetch_yahoo and backtest.py's legacy bare-ticker
+    path -- one normalization, not two diverging ones."""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.columns = [str(c).lower() for c in df.columns]
@@ -93,15 +94,29 @@ def _fetch_yahoo(symbol: str) -> pd.DataFrame:
     return df
 
 
+def _fetch_yahoo(symbol: str) -> pd.DataFrame:
+    df = _yahoo_download(symbol, start="1990-01-01", auto_adjust=True,
+                         progress=False)
+    return normalize_yahoo(df)
+
+
 def _fetch_fred(series: str) -> pd.DataFrame:
-    raw = pd.read_csv(FRED_URL.format(id=series))
-    date_col = raw.columns[0]
-    raw[date_col] = pd.to_datetime(raw[date_col])
-    df = (raw.set_index(date_col)
-             .rename(columns={series: "close"})
-             .apply(pd.to_numeric, errors="coerce").dropna())
+    """Documented macro sources go through pandas-datareader (issue #10 §4):
+    stable endpoints, maintained reader, and one place to add World Bank /
+    OECD / Eurostat later. Yahoo stays yfinance (datareader's Yahoo reader
+    is dead); Stooq stays direct CSV (no datareader reader exists)."""
+    # start=1776-07-04 = "beginning of time" for FRED -- without it the
+    # reader silently truncates to the most recent ~5 years
+    raw = FredReader(series, start="1776-07-04").read()
+    df = raw.apply(pd.to_numeric, errors="coerce").dropna()
+    df.index = pd.to_datetime(df.index)
+    try:
+        df.index = df.index.tz_localize(None)
+    except (TypeError, AttributeError):
+        pass
+    df.columns = ["close"]
     df.index.name = None
-    return df[["close"]]
+    return df
 
 
 def _fetch_stooq(symbol: str) -> pd.DataFrame:
@@ -110,24 +125,120 @@ def _fetch_stooq(symbol: str) -> pd.DataFrame:
     raw["date"] = pd.to_datetime(raw["date"])
     df = raw.set_index("date").apply(pd.to_numeric, errors="coerce").dropna()
     df.index.name = None
-    return df[["open", "high", "low", "close", "volume"]]
+    return df.sort_index()[["open", "high", "low", "close", "volume"]]
 
 
 PROVIDERS = {"yahoo": _fetch_yahoo, "fred": _fetch_fred, "stooq": _fetch_stooq}
 
+# How each requested series was actually served this process: the provider
+# name, "cache", or "fallback:<id>" when a mirror substituted for the
+# primary. Surfaced in reports/leaderboards via provenance_flags().
+PROVENANCE: dict[str, str] = {}
+
+
+def provenance_flags(tickers: list[str]) -> list[str]:
+    out = []
+    for t in tickers:
+        prov = PROVENANCE.get(t)
+        if prov and prov.startswith("fallback:"):
+            out.append(f"WARN: {t} served by fallback {prov.split(':', 1)[1]} "
+                       f"(mirror data may differ in adjustment)")
+    return out
+
+
+_WARNED: set[str] = set()
+
+
+def _warn_frequency(entry: dict) -> None:
+    """Monthly/vintage series released after the period they describe give
+    generated strategies lookahead bias if used directly -- say so loudly,
+    once per series per process."""
+    freq = entry.get("frequency")
+    if freq and freq != "daily" and entry["id"] not in _WARNED:
+        _WARNED.add(entry["id"])
+        print(f"WARNING: {entry['id']} is {freq} -- it is released after the period "
+              f"it describes, so using it directly gives lookahead bias; lag it in "
+              f"the signal or state the caveat in data.caveats")
+
+
+BAR_FREQUENCY = {"1d": "daily", "1wk": "weekly", "1mo": "monthly"}
+
+
+def frequency_flags(tickers: list[str], bar: str | None) -> list[str]:
+    """Spec-level frequency sanity: catalog frequency vs data.bar. A monthly
+    series inside a daily panel creates phantom non-trading bars (diluted
+    Sharpe) and the annualizer still assumes daily bars."""
+    want = BAR_FREQUENCY.get(bar or "1d")
+    if want is None:
+        return []
+    out = []
+    for t in tickers:
+        entry = by_id(t) or by_id(f"yahoo:{t}")
+        if entry and entry.get("frequency") and entry["frequency"] != want:
+            out.append(f"WARN: {entry['id']} is {entry['frequency']} but data.bar is "
+                       f"{bar or '1d'} -- phantom bars dilute Sharpe and the "
+                       f"annualizer assumes daily bars")
+    return out
+
+
+def is_close_only(series_id: str) -> bool:
+    """True when the catalog serves this series as a close-only frame
+    (FRED macro prints). The harness's next_open execution needs `open`."""
+    entry = by_id(series_id) or by_id(f"yahoo:{series_id}")
+    return bool(entry) and entry["id"].startswith("fred:")
+
 # ---------------------------------------------------------------- loading
+
+def cache_path(series_id: str) -> Path:
+    source, symbol = parse_id(series_id)
+    return CACHE_DIR / f"{source}_{re.sub(r'[^A-Za-z0-9]', '_', symbol)}.csv"
+
+
+def _write_cache(cache: Path, df: pd.DataFrame) -> None:
+    """Tmp + replace: an interrupted write can never shadow real data."""
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(".csv.tmp")
+    df.to_csv(tmp)
+    tmp.replace(cache)
+
+
+def _entry_for(series_id: str) -> dict:
+    """Seeded entry, or a synthetic one for unseeded yahoo: ids -- they
+    fetch exactly like bare tickers always have. fred:/stooq: ids must be
+    seeded; a typo should be a loud error, not a silent empty fetch."""
+    entry = by_id(series_id) or (by_id(f"yahoo:{series_id}")
+                                 if ":" not in series_id else None)
+    if entry is not None:
+        return entry
+    source, symbol = parse_id(series_id)   # raises ValueError for unknown sources
+    if source != "yahoo":
+        raise ValueError(f"{series_id!r} not in catalog "
+                         f"(try: python3 catalog.py search <query>)")
+    return {"id": f"yahoo:{symbol}", "title": symbol, "tags": [],
+            "frequency": "daily", "coverage_start": None,
+            "vintage_available": False, "notes": "unseeded yahoo id",
+            "fallback": None}
+
 
 def load(series_id: str, start, end) -> pd.DataFrame:
     """One series, cached, fallback-aware. Normalized frame out:
-    lowercase columns, always with `close`, DatetimeIndex, filtered to
-    [start, end]."""
-    entry = resolve(series_id)
+    lowercase columns, always with `close`, ascending DatetimeIndex,
+    filtered to [start, end]."""
+    entry = _entry_for(series_id)
     source, symbol = parse_id(entry["id"])
-    cache = CACHE_DIR / f"{source}_{re.sub(r'[^A-Za-z0-9]', '_', symbol)}.csv"
+    _warn_frequency(entry)
+    cache = cache_path(entry["id"])
 
+    df = None
     if cache.exists():
         df = pd.read_csv(cache, index_col=0, parse_dates=True)
-    else:
+        if df.empty or "close" not in df.columns:
+            cache.unlink()          # truncated/interrupted write -- refetch
+            df = None
+        else:
+            df = df.sort_index()    # self-heal a poisoned (unsorted) cache
+            PROVENANCE[entry["id"]] = "cache"
+    if df is None:
         try:
             df = PROVIDERS[source](symbol)
             if df.empty:
@@ -136,10 +247,11 @@ def load(series_id: str, start, end) -> pd.DataFrame:
         except Exception as exc:
             if not entry.get("fallback"):
                 raise ValueError(f"{entry['id']}: {exc}") from exc
+            PROVENANCE[entry["id"]] = f"fallback:{entry['fallback']}"
             print(f"{entry['id']}: {exc} -- falling back to {entry['fallback']}")
             return load(entry["fallback"], start, end)
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache)
+        _write_cache(cache, df)
+        PROVENANCE[entry["id"]] = source
 
     if start:
         df = df[df.index >= pd.Timestamp(start)]
@@ -166,6 +278,8 @@ def main_with(argv: list[str] | None = None) -> int:
     p_fetch.add_argument("series_id")
     p_fetch.add_argument("--start", default=None)
     p_fetch.add_argument("--end", default=None)
+    p_fetch.add_argument("--refresh", action="store_true",
+                         help="delete any cached copy first and refetch")
 
     args = ap.parse_args(argv)
 
@@ -184,11 +298,13 @@ def main_with(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             sys.exit(f"error: {exc}")
         for key in ("id", "title", "tags", "frequency", "coverage_start",
-                    "vintage_available", "notes", "fallback"):
+                    "vintage_available", "license", "notes", "fallback"):
             print(f"{key:>17}: {e.get(key)}")
         return 0
 
     if args.cmd == "fetch":
+        if args.refresh:
+            cache_path(args.series_id).unlink(missing_ok=True)
         df = load(args.series_id, args.start, args.end)
         print(f"{args.series_id}: {len(df)} bars cached"
               f"{f' ({df.index[0].date()} -> {df.index[-1].date()})' if len(df) else ''}")

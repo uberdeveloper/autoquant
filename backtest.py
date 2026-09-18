@@ -40,7 +40,10 @@ def load_prices(ticker: str, start, end, cache_dir: Path) -> pd.DataFrame:
     # catalog ids ("fred:DGS10", "yahoo:SPY", ...) go through the catalog;
     # bare tickers keep the legacy yfinance path
     if ":" in ticker:
-        return catalog.load(ticker, start, end)
+        try:
+            return catalog.load(ticker, start, end)
+        except ValueError as exc:   # same friendly exit as the legacy path
+            sys.exit(f"error: {exc}")
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache = cache_dir / f"{ticker.replace('/', '_')}.csv"
     if cache.exists():
@@ -49,10 +52,7 @@ def load_prices(ticker: str, start, end, cache_dir: Path) -> pd.DataFrame:
         import yfinance as yf
 
         df = yf.download(ticker, start="1990-01-01", auto_adjust=True, progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [str(c).lower() for c in df.columns]
-        df.index = pd.to_datetime(df.index).tz_localize(None)
+        df = catalog.normalize_yahoo(df)
         df.to_csv(cache)
     if start:
         df = df[df.index >= pd.Timestamp(start)]
@@ -256,7 +256,10 @@ def load_strategy(slug: str):
 
 
 def run(spec_path: Path, n_trials: int | None) -> dict:
-    spec = yaml.safe_load(spec_path.read_text())
+    return run_spec(yaml.safe_load(spec_path.read_text()), n_trials)
+
+
+def run_spec(spec: dict, n_trials: int | None) -> dict:
     slug = spec["meta"]["slug"]
     mod = load_strategy(slug)
 
@@ -270,10 +273,16 @@ def run(spec_path: Path, n_trials: int | None) -> dict:
                              spec_variant["data"].get("end"), ROOT / "data" / "prices")
             if df.empty:
                 sys.exit(f"no price data for {tickers[0]}")
-            return df
-        data, _ = load_panel(tickers, spec_variant["data"]["start"],
-                             spec_variant["data"].get("end"), ROOT / "data" / "prices")
-        return data
+        else:
+            data, _ = load_panel(tickers, spec_variant["data"]["start"],
+                                 spec_variant["data"].get("end"), ROOT / "data" / "prices")
+        if spec_variant["rules"].get("execution_price") == "next_open":
+            missing = [t for t in tickers
+                       if "open" not in (df if len(tickers) == 1 else data[t]).columns]
+            if missing:
+                sys.exit(f"{', '.join(missing)} has no open column (close-only series) "
+                         f"— set execution_price: close in the spec's rules")
+        return df if len(tickers) == 1 else data
 
     def evaluate(spec_variant: dict, params_override: dict) -> pd.DataFrame:
         """One full evaluation of a (possibly mutated) spec. Shared by the
@@ -331,6 +340,8 @@ def run(spec_path: Path, n_trials: int | None) -> dict:
         n_trials or spec["validation"]["multiple_testing"].get("n_tested_so_far") or 1,
     )
     out["auto_flags"] = auto_flags(spec, out)
+    out["auto_flags"] += catalog.frequency_flags(tickers, spec["data"].get("bar"))
+    out["auto_flags"] += catalog.provenance_flags(tickers)
     return out
 
 

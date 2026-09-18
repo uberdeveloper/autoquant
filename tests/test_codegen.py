@@ -370,3 +370,32 @@ class TestMain:
         monkeypatch.setattr(codegen.llm, "preflight", boom)
         with pytest.raises(SystemExit, match="not found on PATH"):
             codegen.main_with([])
+
+
+def catalog_close_only_frame():
+    import catalog
+    frame = codegen.smoke_frame()
+    assert catalog.is_close_only("fred:DGS10")
+    return frame[["close"]]
+
+
+class TestSourceShapedSmoke:
+    def test_open_dependent_signal_fails_smoke_on_fred_series(self, tmp_path):
+        path = tmp_path / "m.py"
+        path.write_text(
+            "import pandas as pd\n"
+            "def signal(df, **params):\n"
+            "    return (df['open'] > df['open'].rolling(5).mean()).astype(float)\n"
+        )
+        err = codegen.smoke_test(path, {}, df=catalog_close_only_frame())
+        assert err and "open" in err
+
+    def test_close_only_signal_passes_smoke_on_fred_series(self, tmp_path):
+        path = tmp_path / "m.py"
+        path.write_text(
+            "import pandas as pd\n"
+            "def signal(df, **params):\n"
+            "    return (df['close'] > df['close'].rolling(5).mean()).astype(float)\n"
+        )
+        err = codegen.smoke_test(path, {}, df=catalog_close_only_frame())
+        assert err is None
