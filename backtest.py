@@ -256,7 +256,10 @@ def load_strategy(slug: str):
 
 
 def run(spec_path: Path, n_trials: int | None) -> dict:
-    spec = yaml.safe_load(spec_path.read_text())
+    return run_spec(yaml.safe_load(spec_path.read_text()), n_trials)
+
+
+def run_spec(spec: dict, n_trials: int | None) -> dict:
     slug = spec["meta"]["slug"]
     mod = load_strategy(slug)
 
@@ -270,10 +273,16 @@ def run(spec_path: Path, n_trials: int | None) -> dict:
                              spec_variant["data"].get("end"), ROOT / "data" / "prices")
             if df.empty:
                 sys.exit(f"no price data for {tickers[0]}")
-            return df
-        data, _ = load_panel(tickers, spec_variant["data"]["start"],
-                             spec_variant["data"].get("end"), ROOT / "data" / "prices")
-        return data
+        else:
+            data, _ = load_panel(tickers, spec_variant["data"]["start"],
+                                 spec_variant["data"].get("end"), ROOT / "data" / "prices")
+        if spec_variant["rules"].get("execution_price") == "next_open":
+            missing = [t for t in tickers
+                       if "open" not in (df if len(tickers) == 1 else data[t]).columns]
+            if missing:
+                sys.exit(f"{', '.join(missing)} has no open column (close-only series) "
+                         f"— set execution_price: close in the spec's rules")
+        return df if len(tickers) == 1 else data
 
     def evaluate(spec_variant: dict, params_override: dict) -> pd.DataFrame:
         """One full evaluation of a (possibly mutated) spec. Shared by the

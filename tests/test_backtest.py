@@ -613,3 +613,31 @@ class TestCatalogFrequencyFlags:
         flags = catalog.frequency_flags(spec["data"]["universe"],
                                         spec["data"].get("bar"))
         assert any("fred:CPIAUCSL" in f for f in flags)
+
+
+class TestOHLCVContract:
+    def test_close_only_flag_detection(self):
+        import catalog
+        assert catalog.is_close_only("fred:DGS10")
+        assert not catalog.is_close_only("yahoo:SPY")
+        assert not catalog.is_close_only("SPY")
+
+    def test_next_open_on_close_only_series_fails_cleanly(self, tmp_path, monkeypatch):
+        import catalog
+        spec = {
+            "meta": {"slug": "t", "title": "t", "posted": "2021-01-01"},
+            "signal": {"definition": "test", "lag_bars": 1},
+            "rules": {"execution_price": "next_open"},
+            "costs": {"commission_bps": 10, "slippage_bps": 10},
+            "validation": {},
+            "data": {"universe": ["fred:DGS10"], "start": "2020-01-01"},
+        }
+        idx = pd.bdate_range("2020-01-01", periods=60)
+        close = pd.DataFrame({"close": np.linspace(100, 110, 60)}, index=idx)
+        monkeypatch.setattr(backtest.catalog, "load", lambda *a, **k: close.copy())
+        fake_mod = type("M", (), {"signal": staticmethod(
+            lambda df, **k: pd.Series(1.0, index=df.index))})
+        monkeypatch.setattr(backtest, "load_strategy", lambda slug: fake_mod)
+
+        with pytest.raises(SystemExit, match="no open column"):
+            backtest.run_spec(spec, None)

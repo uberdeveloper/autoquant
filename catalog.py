@@ -165,6 +165,13 @@ def frequency_flags(tickers: list[str], bar: str | None) -> list[str]:
                        f"annualizer assumes daily bars")
     return out
 
+
+def is_close_only(series_id: str) -> bool:
+    """True when the catalog serves this series as a close-only frame
+    (FRED macro prints). The harness's next_open execution needs `open`."""
+    entry = by_id(series_id) or by_id(f"yahoo:{series_id}")
+    return bool(entry) and entry["id"].startswith("fred:")
+
 # ---------------------------------------------------------------- loading
 
 def cache_path(series_id: str) -> Path:
