@@ -16,6 +16,7 @@ itself is the state. Re-running skips every slug that already has an outcome.
 from __future__ import annotations
 
 import argparse
+import catalog
 import concurrent.futures
 import json
 import llm
@@ -114,12 +115,28 @@ def validate_spec(doc: dict, expected_slug: str) -> list[str]:
 
     data = doc.get("data")
     uni = data.get("universe") if isinstance(data, dict) else None
-    if not (isinstance(uni, list) and uni
-            and all(isinstance(t, str) and re.fullmatch(r"[A-Z0-9\-\.\^=]{1,12}", t)
-                    for t in uni)):
-        errors.append("data.universe must be an explicit list of Yahoo-format tickers "
-                      "(e.g. [SPY, BTC-USD]) — rule-based universes are unsupported; "
-                      "mark the article UNTESTABLE instead")
+
+    def ticker_ok(t) -> bool:
+        if not isinstance(t, str):
+            return False
+        if re.fullmatch(r"[A-Z0-9\-\.\^=]{1,12}", t):
+            return True                       # legacy bare Yahoo ticker
+        m = re.fullmatch(r"(yahoo|fred|stooq):(.{1,24})", t)
+        if not m:
+            return False
+        if m.group(1) == "yahoo":
+            return True                       # unseeded yahoo ids fetch like bare tickers
+        try:
+            catalog.resolve(t)
+            return True                       # fred:/stooq: ids must be seeded
+        except ValueError:
+            return False
+
+    if not (isinstance(uni, list) and uni and all(ticker_ok(t) for t in uni)):
+        errors.append("data.universe must be explicit tickers or resolvable catalog "
+                      "ids (e.g. [SPY, fred:DGS10] — find ids with "
+                      "python3 catalog.py search) — rule-based universes are "
+                      "unsupported; mark the article UNTESTABLE instead")
     return errors
 
 
