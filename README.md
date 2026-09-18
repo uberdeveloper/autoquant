@@ -60,11 +60,25 @@ check -- a batch never crashes mid-run because the binary disappeared.
 
 Universe entries can be bare Yahoo tickers (`SPY`) or catalog ids:
 `yahoo:SPY`, `fred:DGS10`, `stooq:spy.us`. Find series with
-`python3 catalog.py search <query>`, inspect one with
-`python3 catalog.py show <id>`, and pre-warm the cache with
-`python3 catalog.py fetch <id>`. The committed seed index is
-`catalog.json`; series cache under `data/catalog/`. If a primary provider
-fails, an entry's declared fallback (usually a Yahoo/Stooq mirror) is used
-automatically. Macro entries note their release lag and whether vintage
-(ALFRED) data exists -- loading current-vintage data for backtests has
-lookahead caveats the spec's `data.caveats` should state.
+`python3 catalog.py search <query>` (multi-word queries require every term),
+inspect one with `python3 catalog.py show <id>`, and pre-warm the cache with
+`python3 catalog.py fetch <id>` (`--refresh` forces a refetch). The committed
+seed index is `catalog.json`; series cache under `data/catalog/`. Caches are
+validated on load and written atomically — a truncated cache refetches, it
+never shadows real data. If a primary provider fails, an entry's declared
+fallback (a Yahoo/Stooq mirror) is used and the report's flags record the
+substitution. FRED series load through pandas-datareader; Yahoo stays
+yfinance; Stooq uses its CSV endpoint.
+
+Two caveats the harness flags automatically (they land in the report's
+Automated flags and the leaderboard):
+
+- monthly/vintage series (e.g. `fred:CPIAUCSL`) are released after the
+  period they describe — using them directly gives lookahead bias;
+- a catalog series whose frequency differs from `data.bar` (e.g. a monthly
+  series in a daily panel) distorts Sharpe through phantom bars.
+
+Strategies that run with `execution_price: next_open` require an `open`
+column; close-only FRED series are rejected with a clear message, and the
+codegen smoke test uses source-shaped frames so such strategies fail there
+instead.
