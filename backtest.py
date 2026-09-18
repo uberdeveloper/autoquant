@@ -40,7 +40,10 @@ def load_prices(ticker: str, start, end, cache_dir: Path) -> pd.DataFrame:
     # catalog ids ("fred:DGS10", "yahoo:SPY", ...) go through the catalog;
     # bare tickers keep the legacy yfinance path
     if ":" in ticker:
-        return catalog.load(ticker, start, end)
+        try:
+            return catalog.load(ticker, start, end)
+        except ValueError as exc:   # same friendly exit as the legacy path
+            sys.exit(f"error: {exc}")
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache = cache_dir / f"{ticker.replace('/', '_')}.csv"
     if cache.exists():

@@ -641,3 +641,11 @@ class TestOHLCVContract:
 
         with pytest.raises(SystemExit, match="no open column"):
             backtest.run_spec(spec, None)
+
+    def test_catalog_failure_exits_cleanly(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(backtest.catalog, "load",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                ValueError("fred:NOPE_NOPE not in catalog")))
+
+        with pytest.raises(SystemExit, match="not in catalog"):
+            backtest.load_prices("fred:NOPE_NOPE", None, None, tmp_path)

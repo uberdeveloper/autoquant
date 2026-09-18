@@ -187,11 +187,29 @@ def _write_cache(cache: Path, df: pd.DataFrame) -> None:
     tmp.replace(cache)
 
 
+def _entry_for(series_id: str) -> dict:
+    """Seeded entry, or a synthetic one for unseeded yahoo: ids -- they
+    fetch exactly like bare tickers always have. fred:/stooq: ids must be
+    seeded; a typo should be a loud error, not a silent empty fetch."""
+    entry = by_id(series_id) or (by_id(f"yahoo:{series_id}")
+                                 if ":" not in series_id else None)
+    if entry is not None:
+        return entry
+    source, symbol = parse_id(series_id)   # raises ValueError for unknown sources
+    if source != "yahoo":
+        raise ValueError(f"{series_id!r} not in catalog "
+                         f"(try: python3 catalog.py search <query>)")
+    return {"id": f"yahoo:{symbol}", "title": symbol, "tags": [],
+            "frequency": "daily", "coverage_start": None,
+            "vintage_available": False, "notes": "unseeded yahoo id",
+            "fallback": None}
+
+
 def load(series_id: str, start, end) -> pd.DataFrame:
     """One series, cached, fallback-aware. Normalized frame out:
     lowercase columns, always with `close`, ascending DatetimeIndex,
     filtered to [start, end]."""
-    entry = resolve(series_id)
+    entry = _entry_for(series_id)
     source, symbol = parse_id(entry["id"])
     _warn_frequency(entry)
     cache = cache_path(entry["id"])

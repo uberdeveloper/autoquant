@@ -339,3 +339,27 @@ class TestFrequency:
     def test_frequency_flags_pass_matching_bar(self, tmp_path, monkeypatch):
         flags = catalog.frequency_flags(["SPY"], "1d")
         assert flags == []
+
+
+class TestUnseededYahoo:
+    def test_unseeded_yahoo_id_fetches_like_bare_ticker(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(catalog, "PROVENANCE", {})
+        yf = pd.DataFrame({"Close": [250.0], "Open": [249.0], "High": [251.0],
+                           "Low": [248.0], "Volume": [900]},
+                          index=pd.DatetimeIndex(["2024-01-02"]))
+        _stub_yahoo(monkeypatch, yf)
+
+        df = catalog.load("yahoo:AAPL", None, None)   # not in catalog.json
+
+        assert df["close"].iloc[0] == 250.0
+        assert (tmp_path / "yahoo_AAPL.csv").exists()
+
+    def test_unseeded_fred_id_still_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
+        with pytest.raises(ValueError, match="not in catalog"):
+            catalog.load("fred:NOPE_NOPE", None, None)
+
+    def test_unknown_source_still_raises(self, tmp_path, monkeypatch):
+        with pytest.raises(ValueError, match="unknown source"):
+            catalog.load("bogus:XYZ", None, None)
