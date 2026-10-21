@@ -544,17 +544,19 @@ class TestUvLockInvariant:
         assert fake.calls[0][2] == "--no-project"
         assert fake.calls[1][4].endswith("/.venv/bin/python")
 
-    def test_project_requirements_are_not_rewritten(self, tmp_path,
-                                                    monkeypatch):
+    def test_source_requirements_file_is_byte_identical_after_a_build(
+            self, tmp_path, monkeypatch):
+        # The build filters the pins into a temp file; the repo's own
+        # requirements.txt must come out byte-identical.
         stage(tmp_path, monkeypatch)
         dest = make_repo(tmp_path, deps={"requirements_txt": True,
                                          "environment_yml": False,
                                          "setup_py": False},
                          files={"requirements.txt": "numpy==1.23.1\n"})
+        before = (dest / "requirements.txt").read_bytes()
         monkeypatch.setattr(env_repo, "run_uv", FakeUv())
-        env_repo.main_with([], root=tmp_path)
-        pyproject = (PROJECT_ROOT / "pyproject.toml").read_text()
-        assert "pandas==1.3.5" not in pyproject
+        assert env_repo.main_with([], root=tmp_path) == 0
+        assert (dest / "requirements.txt").read_bytes() == before
 
 
 class TestLegacyFallbackBuild:
@@ -979,6 +981,161 @@ class TestRowExtras:
         env_repo.build_env(dest, manifest_of(dest), "Auquan/Tutorials",
                            root=tmp_path)
         assert not stale.exists()
+
+
+class TestPythonSpecNormalisation:
+    """N1: a conda python pin must reach `uv venv --python` as a plain version."""
+
+    @pytest.mark.parametrize("pin,expected", [
+        ("3.9", "3.9"),
+        ("3.9.*", "3.9"),
+        ("3.*", "3"),
+        ("3", "3"),
+        ("3.9.7=h1234", None),
+    ])
+    def test_wildcard_and_build_pins_are_normalised(self, pin, expected):
+        assert env_repo.environment_python(
+            f"dependencies:\n  - python={pin}\n") == expected
+
+    def test_wildcard_pin_reaches_uv_as_a_plain_version(self, tmp_path,
+                                                        monkeypatch):
+        dest = make_repo(tmp_path, deps={"requirements_txt": False,
+                                         "environment_yml": True,
+                                         "setup_py": False},
+                         files={"environment.yml":
+                                "dependencies:\n  - python=3.9.*\n  - pandas\n"})
+        fake = FakeUv()
+        monkeypatch.setattr(env_repo, "run_uv", fake)
+        env_repo.build_env(dest, manifest_of(dest), "Auquan/Tutorials",
+                           root=tmp_path)
+        assert fake.calls[0][-3] == "--python"
+        assert fake.calls[0][-2] == "3.9"
+
+
+class TestCorruptEnvironmentYml:
+    """N2: a corrupt environment.yml must not abort the whole batch."""
+
+    def test_corrupt_environment_yml_fails_only_that_repo(self, tmp_path,
+                                                          monkeypatch):
+        stage(tmp_path, monkeypatch)
+        make_repo(tmp_path, owner="Good", name="One",
+                  deps={"requirements_txt": True, "environment_yml": False,
+                        "setup_py": False},
+                  files={"requirements.txt": "numpy==1.23.1\n"})
+        make_repo(tmp_path, owner="Bad", name="Two",
+                  deps={"requirements_txt": False, "environment_yml": True,
+                        "setup_py": False},
+                  files={"environment.yml":
+                         "dependencies:\n  - python=3.9\n  - [unclosed\n"})
+        monkeypatch.setattr(env_repo, "run_uv", FakeUv())
+        assert env_repo.main_with([], root=tmp_path) == 1
+        rows = {r["repo"]: r for r in env_repo.load(env_repo.ENVS)}
+        assert rows["Good/One"]["status"] == "ready"
+        assert rows["Bad/Two"]["status"] == "failed"
+        assert env_repo.ENVS.exists()
+
+
+class TestDeclaredDepsSourceOnFailure:
+    """N3: a failed row must record the DECLARED dep source."""
+
+    def test_missing_declared_requirements_txt_records_the_source(
+            self, tmp_path, monkeypatch):
+        stage(tmp_path, monkeypatch)
+        make_repo(tmp_path, deps={"requirements_txt": True,
+                                  "environment_yml": False, "setup_py": False})
+        monkeypatch.setattr(env_repo, "run_uv", FakeUv())
+        assert env_repo.main_with([], root=tmp_path) == 1
+        row = env_repo.load(env_repo.ENVS)[0]
+        assert row["status"] == "failed"
+        assert row["deps_source"] == "requirements.txt"
+
+    def test_corrupt_environment_yml_records_the_declared_source(
+            self, tmp_path, monkeypatch):
+        stage(tmp_path, monkeypatch)
+        make_repo(tmp_path, deps={"requirements_txt": False,
+                                  "environment_yml": True, "setup_py": False},
+                  files={"environment.yml": "dependencies:\n  - [unclosed\n"})
+        monkeypatch.setattr(env_repo, "run_uv", FakeUv())
+        assert env_repo.main_with([], root=tmp_path) == 1
+        row = env_repo.load(env_repo.ENVS)[0]
+        assert row["status"] == "failed"
+        assert row["deps_source"] == "environment.yml"
+
+
+class TestLegacyHandoffShape:
+    """The #27 handoff contract: build_env(mode="legacy-fallback", ...)."""
+
+    def test_handoff_build_shape(self, tmp_path, monkeypatch):
+        dest = make_repo(tmp_path)
+        calls: list[list[str]] = []
+        seen: dict = {}
+
+        def fake(argv, timeout=None):
+            calls.append(list(argv))
+            if argv[1] == "venv":
+                # no pyvenv.cfg: the row then records the requested spec
+                Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+            else:
+                seen["text"] = Path(argv[-1]).read_text()
+            return ""
+
+        monkeypatch.setattr(env_repo, "run_uv", fake)
+        row = env_repo.build_env(dest, manifest_of(dest), "Auquan/Tutorials",
+                                 mode="legacy-fallback", python="3.9",
+                                 requirements=list(env_repo.LEGACY_PINS),
+                                 root=tmp_path)
+        assert calls[0] == ["uv", "venv", "--no-project", "--clear",
+                            "--python", "3.9", str(dest / ".venv-legacy")]
+        assert calls[1][:5] == ["uv", "pip", "install", "--python",
+                                str(dest / ".venv-legacy" / "bin" / "python")]
+        assert calls[1][5] == "-r"
+        assert seen["text"].splitlines() == list(env_repo.LEGACY_PINS)
+        assert row["mode"] == "legacy-fallback"
+        assert row["venv"] == "data/repos/Auquan-Tutorials/.venv-legacy"
+        assert row["python"] == "3.9"
+        assert row["deps_sha256"] == hashlib.sha256(
+            "\n".join(env_repo.LEGACY_PINS).encode()).hexdigest()
+
+
+class TestSelectiveRunPreservation:
+    """A selective run must not drop the rows of the repos it skipped."""
+
+    def test_selective_run_preserves_the_other_rows(self, tmp_path,
+                                                    monkeypatch):
+        stage(tmp_path, monkeypatch)
+        make_repo(tmp_path, owner="Good", name="One",
+                  deps={"requirements_txt": True, "environment_yml": False,
+                        "setup_py": False},
+                  files={"requirements.txt": "numpy==1.23.1\n"})
+        make_repo(tmp_path, owner="Bad", name="Two",
+                  deps={"requirements_txt": True, "environment_yml": False,
+                        "setup_py": False},
+                  files={"requirements.txt": "pandas==1.3.5\n"})
+        monkeypatch.setattr(env_repo, "run_uv", FakeUv())
+        assert env_repo.main_with([], root=tmp_path) == 0
+        assert len(env_repo.load(env_repo.ENVS)) == 2
+        assert env_repo.main_with(["Good/One"], root=tmp_path) == 0
+        rows = {r["repo"]: r for r in env_repo.load(env_repo.ENVS)}
+        assert "Bad/Two" in rows
+        assert rows["Bad/Two"]["status"] == "ready"
+
+
+class TestPythonPrecedence:
+    """The documented order: legacy arg > conda pin > explicit arg > default."""
+
+    def test_conda_pin_beats_the_explicit_python_argument(self, tmp_path,
+                                                          monkeypatch):
+        dest = make_repo(tmp_path, deps={"requirements_txt": False,
+                                         "environment_yml": True,
+                                         "setup_py": False},
+                         files={"environment.yml":
+                                "dependencies:\n  - python=3.9\n  - pandas\n"})
+        fake = FakeUv()
+        monkeypatch.setattr(env_repo, "run_uv", fake)
+        env_repo.build_env(dest, manifest_of(dest), "Auquan/Tutorials",
+                           python="3.11", root=tmp_path)
+        assert fake.calls[0][-3] == "--python"
+        assert fake.calls[0][-2] == "3.9"
 
 
 class TestUvArgvFlags:

@@ -38,6 +38,20 @@ MUST-HONOUR SIGNAL: a non-empty `blocked` list on the row is the SKIP signal.
 #27 MUST downgrade those artifacts to SKIP with the recorded reason; a
 non-empty `blocked` list is never ignorable.
 
+ROW CONTRACT for #27 (read before consuming a row):
+
+* A row built with an explicit `requirements=` argument (the legacy
+  fallback) keys its `env_key` and `deps_sha256` over the JOINED PINS, not
+  over any file's text.  Such a row is ephemeral: a later `main_with` run
+  for the same repo rebuilds the row from the repo's own dep file and
+  REPLACES it.
+* `mode` is the discriminator for a row whose `python` is null: "main" means
+  the repo runs in the main project env (no venv, no pins), while
+  "repo-venv" and "legacy-fallback" are rows with a real interpreter.
+* A row whose `status` is "failed" has an EMPTY `blocked` list, so
+  consumers must NEVER read `blocked` off a failed row -- the SKIP signal
+  exists only on "ready" rows.
+
 This stage never writes to `data/repo_triage.jsonl` -- `triage_repo.py` owns
 that file (one writer per file).
 """
@@ -225,8 +239,16 @@ def _is_pip_spec(spec: str) -> bool:
 
 
 def _environment_yml_requirements(path: Path) -> tuple[list[str], int]:
-    """(pip requirements, dropped conda entries) of a conda environment.yml."""
-    obj = yaml.safe_load(Path(path).read_text(errors="replace"))
+    """(pip requirements, dropped conda entries) of a conda environment.yml.
+
+    A file that is not valid YAML yields ([], 0) instead of raising: one
+    corrupt file must not abort a whole batch (the caller decides what to do
+    with it -- `env_state` turns a corrupt file into a failed row).
+    """
+    try:
+        obj = yaml.safe_load(Path(path).read_text(errors="replace"))
+    except yaml.YAMLError:
+        return [], 0
     deps = obj.get("dependencies") if isinstance(obj, dict) else None
     out: list[str] = []
     dropped = 0
@@ -250,11 +272,35 @@ def _environment_yml_requirements(path: Path) -> tuple[list[str], int]:
     return out, dropped
 
 
+_PYTHON_VERSION_RE = re.compile(r"^\d+(\.\d+)*$")
+
+
+def _normalise_python_spec(spec: str) -> str | None:
+    """A plain dotted python version, or None when the spec is not one.
+
+    `uv venv --python` only accepts a plain version ("3.9", "3.9.7"); a conda
+    matchspec ("3.9.*") or a conda build string ("3.9.7=h1234") makes uv
+    hard-fail the whole build.
+
+    The boundary: a trailing ".*" wildcard is stripped and the rest must be
+    a plain dotted version ("3.9.*" -> "3.9", "3.*" -> "3", "3" -> "3").
+    Anything else -- a wildcard that is not a trailing ".*", a build string,
+    garbage -- returns None, so the caller falls back to DEFAULT_PYTHON.
+    """
+    s = spec.strip()
+    if s.endswith(".*"):
+        s = s[:-2]
+    return s if _PYTHON_VERSION_RE.match(s) else None
+
+
 def environment_python(yml_text: str) -> str | None:
-    """The conda `python=` pin of an environment.yml, e.g. "3.9" (or None).
+    """The conda `python=` pin of an environment.yml as a plain version.
 
     The pin is the repo's own declaration of the interpreter it expects;
-    when it is present it is the interpreter the env is built with.
+    when it is present it is the interpreter the env is built with.  It is
+    normalised to a plain dotted version (see `_normalise_python_spec`), so
+    it can be handed to `uv venv --python` unchanged; a pin that is not a
+    usable version yields None, and the caller falls back to DEFAULT_PYTHON.
     """
     try:
         obj = yaml.safe_load(yml_text)
@@ -266,9 +312,9 @@ def environment_python(yml_text: str) -> str | None:
     for item in deps:
         if not isinstance(item, str):
             continue
-        m = re.match(r"^\s*python\s*={1,2}\s*([A-Za-z0-9._*]+)\s*$", item)
+        m = re.match(r"^\s*python\s*={1,2}\s*(\S+)\s*$", item)
         if m:
-            return m.group(1)
+            return _normalise_python_spec(m.group(1))
     return None
 
 
@@ -399,6 +445,15 @@ def run_uv(argv: list[str], timeout: int = UV_TIMEOUT) -> str:
     return (r.stdout or "").strip()
 
 
+def _environment_yml_parses(text: str) -> bool:
+    """True when `text` is valid YAML (a corrupt file is not usable)."""
+    try:
+        yaml.safe_load(text)
+    except yaml.YAMLError:
+        return False
+    return True
+
+
 def _read_text(path: Path) -> str:
     try:
         return Path(path).read_text(errors="replace")
@@ -433,6 +488,8 @@ def env_state(dest: Path, manifest: dict) -> dict:
     elif source == "environment.yml":
         deps_text = _read_text(dest / source)
         if deps_text:
+            if not _environment_yml_parses(deps_text):
+                raise ValueError("environment.yml is not valid YAML")
             requirements, dropped = _environment_yml_requirements(dest / source)
             conda_python = environment_python(deps_text)
     sha = _manifest_sha(manifest)
@@ -709,7 +766,13 @@ def main_with(argv: list[str] | None = None, root: Path | None = None) -> int:
                                     timeout=args.timeout, root=root)
                     verb = "built"
             except (RuntimeError, ValueError, OSError) as exc:
-                row = _failed_row(label, dest, state, str(exc), root)
+                # A repo whose state could not even be read (a declared dep
+                # file that is missing, a corrupt environment.yml) must still
+                # record the DECLARED dep source, not "none".
+                failed_state = state or {
+                    "deps_source": deps_source(dest, manifest),
+                    "sha": _manifest_sha(manifest)}
+                row = _failed_row(label, dest, failed_state, str(exc), root)
                 failed += 1
                 verb = "FAILED"
                 print(f"[{i}/{len(entries)}] FAILED  {label}: {exc}",
