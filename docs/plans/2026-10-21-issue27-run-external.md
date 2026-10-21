@@ -10,7 +10,7 @@ Part of #22 (external strategy-repo lane). Stage: triage_repo [3b #24] → env_r
 saved executed notebooks**, and promotes interesting artifacts into `specs/ext-…​.yaml` so they
 enter the existing extract→codegen→backtest lane. Follows the `backtest_batch.py` isolation model:
 each artifact runs in its **own subprocess** with a **hard timeout**, and a re-run **skips** any
-artifact that already has a leaderboard row.
+artifact that already has a **successful (`ok`)** leaderboard row.
 
 ## Hard constraints (binding)
 
@@ -100,9 +100,11 @@ artifact that already has a leaderboard row.
      that raise stop the run; the partial executed notebook + traceback are still saved as evidence.
 - Evidence: executed notebook saved to `results/external/<repo>/<artifact-stem>.ipynb` (browsable),
   plus a `.log` of captured output. `cells_executed` = count of code cells run before completion/stop.
+  An empty (0-byte) log is no evidence: it is removed and never listed in the row's `outputs`.
 
 ### 3. External leaderboard (fresh contract, JSONL)
-`results/external/leaderboard.jsonl`, append-only, one row per artifact. Row keys:
+`results/external/leaderboard.jsonl`, append-only history, **one logical row per artifact** (the
+latest row of each `artifact_key`). Row keys:
 ```json
 {"repo": "owner/name", "kind": "notebook|script|spec", "path": "<artifact path in repo>",
  "artifact_key": "<repo>|<kind>|<path>  (resume key)",
@@ -111,8 +113,12 @@ artifact that already has a leaderboard row.
  "data_mode": "ours|bundled|none", "outputs": ["<relative produced files>"],
  "reason": "<skip/error reason or ''>", "run_at": "<iso z>"}
 ```
-Resume: `already_run(results/external/leaderboard.jsonl) -> set[artifact_key]`; an artifact with an
-existing row is skipped on re-run (acceptance). Failures also appended to
+Resume: `already_run(results/external/leaderboard.jsonl) -> set[artifact_key]`; an artifact whose
+latest row is `ok` is skipped on re-run (acceptance). `skip`/`error`/`timeout` rows are **not**
+terminal — they are retried on the next run, and the leaderboard keeps their history (the file is
+append-only), so the logical view (one row per `artifact_key`) is what callers read. A repeated,
+unchanged verdict is not appended again, so a permanently skipped artifact does not grow the file.
+Failures also appended to
 `results/external/failed.jsonl`. `SPEC_ARTIFACT` rows get `verdict` set (e.g. `"spec"`) and route to
 promotion without execution.
 
@@ -131,6 +137,12 @@ promotion without execution.
 - `--promote` does NOT itself run backtest (no network/LLM in this stage); it produces the spec +
   strategy that the existing lane consumes. Document that the placeholder signal is a scaffold, not a
   validated strategy (honest disclosure).
+- The publication date is never invented: without a date in the triage row the promotion is refused
+  — `--posted YYYY-MM-DD` supplies it (`meta.posted`, `validation.oos_start`). The value must be
+  exactly an ISO date (`^\d{4}-\d{2}-\d{2}$`): a truncated/padded typo is refused, never truncated.
+- Re-promoting an already promoted artifact is refused; `--force` overwrites it. A **failed**
+  promotion (the scaffold fails the smoke test) leaves the tree exactly as it was: the new files are
+  removed and a previous promotion is restored unchanged.
 
 ### 5. CLI
 ```
@@ -138,6 +150,8 @@ python run_external.py                       # run every triaged artifact not ye
 python run_external.py --jobs 4 --timeout 600
 python run_external.py --repo owner/name     # restrict to one repo
 python run_external.py --promote <path-or-key>   # scaffold spec+strategy for one artifact
+python run_external.py --promote <path-or-key> --posted 2024-05-01   # explicit publication date
+python run_external.py --promote <path-or-key> --force                # overwrite an existing promotion
 ```
 `main_with(argv, root=None) -> int`; `root` scopes the data/results paths for tests (like
 `env_repo`/`triage_repo`). Uses the triage file `data/repo_triage.jsonl` as input.
@@ -157,7 +171,8 @@ python run_external.py --promote <path-or-key>   # scaffold spec+strategy for on
       → `test_run_external.py` drives `main_with(["--repo","…"])` over a synthetic triaged repo and
       asserts `results/external/leaderboard.jsonl` rows + `results/external/<repo>/<stem>.ipynb` exist.
 - [ ] Re-run skips completed artifacts → second `main_with` does not re-launch (subprocess seam not
-      called for artifacts already on the leaderboard).
+      called for artifacts whose latest leaderboard row is `ok`; `skip`/`error`/`timeout` artifacts
+      are retried and the leaderboard keeps one logical row per `artifact_key`).
 - [ ] `--promote` produces a spec that passes `backtest.py` smoke validation → promoted spec passes
       `extract.validate_spec` and its `strategies/<slug>.py` passes `codegen.smoke_test` (both
       called directly in the test; `backtest.py` itself not invoked to avoid network).
