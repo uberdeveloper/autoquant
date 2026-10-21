@@ -23,6 +23,7 @@ python3 harvest_cboe.py           # [1] Cboe Insights (RSS; --backfill N for arc
 python3 harvest_arxiv.py          # [1] arXiv papers (abstract-as-body; --limit N, cap 1000)
 python3 fetch.py                  # [2] article text -> data/pages/
 python3 triage.py                 # [3] backtestability scores -> data/triage.jsonl
+python3 triage_repo.py            # [3b] repo artifact runnability verdicts -> data/repo_triage.jsonl
 python3 extract.py                # [4] triaged article -> specs/<slug>.yaml
 python3 codegen.py                # [5] spec -> strategies/<slug>.py (smoke-tested)
 python3 backtest_batch.py         # [6-8] every spec, isolated process, timeout-capped
