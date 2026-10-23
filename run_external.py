@@ -34,7 +34,10 @@ Hard rules this module keeps
   ``nbconvert`` / ``nbformat`` are not available and must not be added.  The
   documented limitation is that the *per-cell* timeout of a real Jupyter
   kernel is relaxed to a **total per-artifact** timeout -- one hung cell eats
-  the whole budget.
+  the whole budget.  Jupyter-only syntax (a cell magic like
+  ``%matplotlib inline``, a shell escape like ``!pip install ...``) is not
+  Python: those lines are **skipped** by the runner, so such a notebook is
+  executed instead of dying with a SyntaxError.
 
     python3 run_external.py                          # every triaged artifact
     python3 run_external.py --jobs 4 --timeout 600
@@ -256,6 +259,35 @@ def env_rows_by_repo(path: Path) -> dict[str, dict]:
     return out
 
 
+def _error_tail(error: str | None, limit: int = 600) -> str:
+    """The end of a long build log -- that is where the cause is.
+
+    A failed env build keeps the whole uv log (tens of kB) in
+    ``data/repo_envs.jsonl``; copying it into every leaderboard row buries
+    the actual cause under the download noise, so only the tail is quoted.
+    """
+    text = (error or "").strip()
+    if not text:
+        return "unknown error"
+    if len(text) <= limit:
+        return text
+    return "...(truncated) " + text[-limit:]
+
+
+def _blocked_reason(repo: str, blocked: list) -> str:
+    """A bounded skip reason that still names the blocked entries.
+
+    A ready row's ``blocked`` list can hold an entire repo's block dump
+    (93 dict reprs in production); joining it unbounded copied 16 kB into
+    every skip row of that repo -- 71% of the leaderboard for none of the
+    skipped artifacts.  Only the tail of the list is quoted, with the same
+    ``_error_tail`` marker rule as env-build logs.
+    """
+    entries = "; ".join(str(b) for b in blocked)
+    return "env for %s is blocked: %s" % (repo, _error_tail(entries,
+                                                            limit=300))
+
+
 def select_env(row: dict, env_rows: dict[str, dict],
                layout: Layout) -> dict:
     """Pick the interpreter + environment for one triaged artifact.
@@ -296,13 +328,12 @@ def select_env(row: dict, env_rows: dict[str, dict],
         status = env_row.get("status")
         if status == "failed":
             return skip(f"env build failed for {repo}: "
-                        f"{env_row.get('error') or 'unknown error'}")
+                        f"{_error_tail(env_row.get('error'))}")
         if status != "ready":
             return skip(f"env row for {repo} is not ready (status={status!r})")
         blocked = env_row.get("blocked") or []
         if blocked:
-            return skip("env for %s is blocked: %s"
-                        % (repo, "; ".join(str(b) for b in blocked)))
+            return skip(_blocked_reason(repo, blocked))
         return {"run": True, "reason": "", "env": base,
                 "env_id": env_row.get("env_key") or "main",
                 "data_mode": "none", "python": interpreter(env_row, layout)}
@@ -313,6 +344,13 @@ def select_env(row: dict, env_rows: dict[str, dict],
     else:
         env = base
         data_mode = "bundled"
+
+    if (env_row is not None and env_row.get("status") == "ready"
+            and (env_row.get("blocked") or [])):
+        # C3 / env_repo ROW CONTRACT: a non-empty `blocked` list on a READY
+        # row is the SKIP signal on every verdict, RUN_* included.
+        return skip(_blocked_reason(repo, env_row["blocked"]),
+                    data_mode=data_mode)
 
     if (env_row is not None and env_row.get("status") == "ready"
             and not (env_row.get("blocked") or [])):
@@ -392,7 +430,9 @@ def _launch(cmd: list[str], cwd: Path | None = None, env: dict | None = None,
         return {"ok": False, "error": f"timed out after {timeout}s",
                 "timeout": True, "stdout": out, "stderr": err}
     if proc.returncode != 0:
-        return {"ok": False, "error": f"exit {proc.returncode}: {stderr[-300:]}",
+        return {"ok": False,
+                "error": f"exit {proc.returncode}: "
+                         f"{_error_tail(stderr, limit=300)}",
                 "timeout": False, "stdout": stdout, "stderr": stderr}
     return {"ok": True, "error": "", "timeout": False, "stdout": stdout,
             "stderr": stderr}
@@ -456,10 +496,16 @@ def _file_set(directory: Path) -> set[str]:
 # nbclient offers) is not possible here.  A cell that raises stops the run;
 # the partial executed notebook and the traceback are still written as
 # evidence.
+#
+# Jupyter-only lines (a cell magic "%matplotlib inline", a shell escape
+# "!pip install ...") are SKIPPED by the runner: they are valid notebook
+# syntax but not Python, and dying on them would hide the artifact's real
+# outcome behind a SyntaxError.
 _NOTEBOOK_RUNNER = r'''
 import contextlib
 import io
 import json
+import re
 import sys
 import traceback
 
@@ -481,12 +527,53 @@ ns = {"__name__": "__main__"}
 executed = 0
 failure = None
 
+# A Jupyter-only line: a line magic ("%matplotlib inline") or a shell
+# escape ("!pip install ...").  They are valid notebook syntax but not
+# Python, so they are dropped from a cell that fails to compile.
+_MAGIC_RE = re.compile(r"^[ \t]*[%!]")
+
+# Cell magics whose BODY is Python: the magic line is dropped and the body
+# runs.  Any other cell magic (%%bash, %%writefile, %%HTML, ...) has a
+# non-Python body and its cell is skipped whole -- executing a shell script
+# or HTML as Python would be wrong.
+_PYTHON_CELL_MAGICS = ("time", "timeit", "capture", "prun")
+
+
+def _prep(src):
+    """Python source for one cell body, or None if it cannot be made Python.
+
+    compile-first: a cell whose source is valid Python runs byte-for-byte
+    unchanged -- a line that merely LOOKS like a magic (a `%` modulo
+    continuation, magic-looking text inside a triple-quoted string) is
+    preserved.  Only a cell that fails to compile has its magic/shell lines
+    stripped, and it is retried as-is after that.
+    """
+    try:
+        compile(src, "<cell>", "exec")
+        return src
+    except SyntaxError:
+        pass
+    return "\n".join(ln for ln in src.splitlines()
+                     if not _MAGIC_RE.match(ln))
+
 
 def _src(cell):
+    """The Python to run for one cell, or None if the cell is skipped."""
     src = cell.get("source")
     if isinstance(src, list):
         src = "".join(src)
-    return src if isinstance(src, str) else ""
+    if not isinstance(src, str):
+        return ""
+    first = src.lstrip().split("\n", 1)[0]
+    if first.startswith("%%"):
+        name = first[2:].split()[0] if first[2:].split() else ""
+        if name not in _PYTHON_CELL_MAGICS:
+            return None               # non-Python body: skip the whole cell
+        body = src.split("\n", 1)[1] if "\n" in src else ""
+        prepared = _prep(body)
+        return "" if prepared is None else prepared
+    prepared = _prep(src)
+    return "" if prepared is None else prepared
 
 
 def _flush():
@@ -507,9 +594,12 @@ try:
         if not isinstance(cell, dict) or cell.get("cell_type") != "code":
             continue
         out, err = io.StringIO(), io.StringIO()
+        src = _src(cell)
+        if src is None:
+            continue          # a non-Python cell magic: skipped, not executed
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                exec(compile(_src(cell), "<cell %d>" % i, "exec"), ns)
+                exec(compile(src, "<cell %d>" % i, "exec"), ns)
         except BaseException:
             failure = traceback.format_exc()
             cell["outputs"] = [
@@ -522,6 +612,10 @@ try:
             log.write(err.getvalue())
             log.write(failure)
             _flush()
+            # C1: the leaderboard row's reason is built from the launcher's
+            # stderr tail, so the traceback MUST reach stderr -- writing it
+            # only to the log left every error row an empty "exit 1: ".
+            sys.stderr.write(failure)
             sys.exit(1)
         executed += 1
         cell["outputs"] = [

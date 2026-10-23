@@ -181,6 +181,27 @@ class TestLaunch:
         assert res["ok"] is False
         assert "exit 3" in res["error"]
 
+    def test_a_long_stderr_tail_is_truncated_with_a_marker(self, monkeypatch):
+        # C1: a silent 300-char cut hides where the tail came from; the
+        # launcher must use the same truncation-marker rule as _error_tail.
+        class FakePopen:
+            pid = 1
+            returncode = 1
+
+            def __init__(self, *a, **k):
+                pass
+
+            def communicate(self, timeout=None):
+                return "", "noise\n" * 500 + "ModuleNotFoundError: nope"
+
+        monkeypatch.setattr(run_external.subprocess, "Popen",
+                            lambda *a, **k: FakePopen())
+        res = run_external._launch(["python", "-c", "x"], timeout=10)
+        assert res["ok"] is False
+        assert res["error"].startswith("exit 1: ...(truncated)")
+        assert "ModuleNotFoundError: nope" in res["error"]
+        assert len(res["error"]) < 400
+
     def test_launch_failure_is_reported_not_raised(self, monkeypatch):
         def fake_popen(*a, **k):
             raise FileNotFoundError(2, "No such file or directory", "uv")
@@ -304,6 +325,82 @@ class TestNotebook:
         assert res["ok"] is True
         assert res["cells_executed"] == 1
 
+    def test_ipython_magics_and_shell_lines_are_skipped_not_fatal(
+            self, tmp_path, monkeypatch):
+        # Jupyter-only syntax (`%magic`, `!shell`) is valid in a notebook but
+        # is not Python: the runner must skip those lines, not die with a
+        # SyntaxError that hides the artifact's real failure.
+        work = self._work(tmp_path, [
+            "%matplotlib inline\nprint('after magic')\n",
+            "!pip install pandas==0.24.1 --user\nprint('after shell')\n",
+            "%%capture\nprint('after cell magic')\n",
+        ])
+        out_ipynb, out_log = tmp_path / "out.ipynb", tmp_path / "out.log"
+        monkeypatch.setattr(run_external, "_launch", make_launcher([]))
+        res = run_external._run_notebook("nb.ipynb", out_ipynb, out_log,
+                                         ["python"], 30, {}, work)
+        assert res["ok"] is True
+        assert res["cells_executed"] == 3
+        doc = json.loads(out_ipynb.read_text())
+        texts = [o.get("text", "") for c in doc["cells"] for o in c["outputs"]]
+        assert any("after magic" in t for t in texts)
+        assert any("after shell" in t for t in texts)
+        assert any("after cell magic" in t for t in texts)
+
+    def test_valid_python_with_magic_looking_lines_runs_unmodified(
+            self, tmp_path, monkeypatch):
+        # C2: a line that merely *looks* like a magic (starts with %) but is
+        # valid Python (a modulo continuation inside parentheses) must run
+        # unmodified -- the old unconditional strip broke it into a
+        # SyntaxError.  compile-first: strip only if the source fails to
+        # compile.
+        work = self._work(tmp_path, ["x = (100\n  % 7)\nprint(x)\n"])
+        out_ipynb, out_log = tmp_path / "out.ipynb", tmp_path / "out.log"
+        monkeypatch.setattr(run_external, "_launch", make_launcher([]))
+        res = run_external._run_notebook("nb.ipynb", out_ipynb, out_log,
+                                         ["python"], 30, {}, work)
+        assert res["ok"] is True, out_log.read_text()
+        assert res["cells_executed"] == 1
+        doc = json.loads(out_ipynb.read_text())
+        texts = [o.get("text", "") for c in doc["cells"] for o in c["outputs"]]
+        assert any("2" in t for t in texts)      # 100 % 7 == 2
+
+    def test_a_magic_looking_line_inside_a_string_literal_is_preserved(
+            self, tmp_path, monkeypatch):
+        # C2: stripping must never delete text inside a triple-quoted string
+        # (the old strip silently rewrote the source that ran).  A cell whose
+        # source compiles is executed byte-for-byte unchanged.
+        cell = ('note = """\n%pip install pandas\n!rm -rf /\n"""\n'
+                "print('kept' if '!rm -rf' in note else 'lost')\n")
+        work = self._work(tmp_path, [cell])
+        out_ipynb, out_log = tmp_path / "out.ipynb", tmp_path / "out.log"
+        monkeypatch.setattr(run_external, "_launch", make_launcher([]))
+        res = run_external._run_notebook("nb.ipynb", out_ipynb, out_log,
+                                         ["python"], 30, {}, work)
+        assert res["ok"] is True, out_log.read_text()
+        doc = json.loads(out_ipynb.read_text())
+        texts = [o.get("text", "") for c in doc["cells"] for o in c["outputs"]]
+        assert any("kept" in t for t in texts)
+
+    def test_a_non_python_cell_magic_skips_the_whole_cell(
+            self, tmp_path, monkeypatch):
+        # C2: %%bash's body is a shell script, not Python; executing it as
+        # Python is wrong (it used to fail with a SyntaxError that hid the
+        # notebook's real outcome).  The whole cell is skipped and the run
+        # continues with the next cell.
+        work = self._work(tmp_path, ["%%bash\necho hi > made.txt\n",
+                                     "print('b')\n"])
+        out_ipynb, out_log = tmp_path / "out.ipynb", tmp_path / "out.log"
+        monkeypatch.setattr(run_external, "_launch", make_launcher([]))
+        res = run_external._run_notebook("nb.ipynb", out_ipynb, out_log,
+                                         ["python"], 30, {}, work)
+        assert res["ok"] is True, out_log.read_text()
+        assert res["cells_executed"] == 1       # %%bash cell skipped, not run
+        doc = json.loads(out_ipynb.read_text())
+        texts = [o.get("text", "") for c in doc["cells"] for o in c["outputs"]]
+        assert any("b" in t for t in texts)
+        assert not (work / "made.txt").exists()
+
     def test_one_subprocess_per_notebook(self, tmp_path, monkeypatch):
         work = self._work(tmp_path, ["print('a')\n", "print('b')\n"])
         calls: list = []
@@ -386,6 +483,29 @@ class TestMain:
         run_external.main_with([], root=tmp_path)
         assert run_external._file_set(src) == before
 
+    def test_a_blocked_env_row_downgrades_a_run_verdict_without_launching(
+            self, tmp_path, monkeypatch):
+        # C3: the env_repo ROW CONTRACT -- a ready row with a non-empty
+        # ``blocked`` list is the SKIP signal on EVERY verdict, including
+        # RUN_WITH_OUR_DATA.  The artifact must be skipped with a reason
+        # naming the blocked entries and zero launcher calls.
+        self._repo(tmp_path)
+        write_envs(tmp_path, [{"repo": "owner/name", "status": "ready",
+                               "mode": "main", "venv": None,
+                               "env_key": "abc123", "deps_sha256": "",
+                               "error": "", "blocked": [
+                                   {"kind": "notebook", "path": "nb.ipynb",
+                                    "reason": "ta-lib is required"}]}])
+        calls: list = []
+        monkeypatch.setattr(run_external, "_launch", make_launcher(calls))
+        assert run_external.main_with([], root=tmp_path) == 0
+        row = json.loads((tmp_path / "results" / "external" / "leaderboard.jsonl")
+                          .read_text().splitlines()[0])
+        assert row["verdict"] == "skip"
+        assert "blocked" in row["reason"]
+        assert "ta-lib is required" in row["reason"]
+        assert calls == []                       # never launched
+
     def test_spec_artifact_is_recorded_but_not_executed(self, tmp_path, monkeypatch):
         make_repo(tmp_path, files={"strategy.yaml": "meta: {}\n"})
         write_triage(tmp_path, [triage_row(kind="spec", path="strategy.yaml",
@@ -424,6 +544,28 @@ class TestMain:
         assert row["reason"]
         failed = (tmp_path / "results" / "external" / "failed.jsonl").read_text()
         assert "boom" in failed or "exit 1" in failed
+
+    def test_a_failing_notebook_row_carries_the_traceback_tail(
+            self, tmp_path, monkeypatch):
+        # C1: a real subprocess (the runner writes the traceback to stderr
+        # on failure) must surface that traceback in the leaderboard row's
+        # reason -- "exit 1: " with an empty tail is not diagnosable.
+        self._repo(tmp_path, cells=("raise ValueError('boom')\n",))
+
+        real_select = run_external.select_env
+
+        def select(row, env_rows, layout):
+            choice = real_select(row, env_rows, layout)
+            choice["python"] = [sys.executable]      # a real interpreter
+            return choice
+
+        monkeypatch.setattr(run_external, "select_env", select)
+        assert run_external.main_with([], root=tmp_path) == 0
+        row = json.loads((tmp_path / "results" / "external" / "leaderboard.jsonl")
+                          .read_text().splitlines()[0])
+        assert row["verdict"] == "error"
+        assert "ValueError" in row["reason"]
+        assert "boom" in row["reason"]
 
     def test_timeout_is_recorded_as_timeout(self, tmp_path, monkeypatch):
         self._repo(tmp_path)
@@ -836,6 +978,73 @@ class TestSelectEnv:
                                       {"owner/name": row}, layout)
         assert res["run"] is False
         assert "ta-lib missing" in res["reason"]
+
+    def test_run_verdict_ready_row_with_blocked_downgrades_to_skip(self, tmp_path):
+        # C3: env_repo ROW CONTRACT -- non-empty blocked on a READY row is
+        # the SKIP signal on the RUN_* paths too, not only NEEDS_HEAVY_ENV.
+        layout = self._layout(tmp_path)
+        row = {"repo": "owner/name", "status": "ready",
+               "blocked": [{"kind": "notebook", "path": "nb.ipynb",
+                            "reason": "ta-lib is required"}],
+               "mode": "main", "venv": None, "env_key": "abc123"}
+        res = run_external.select_env(triage_row(verdict="RUN_WITH_OUR_DATA"),
+                                      {"owner/name": row}, layout)
+        assert res["run"] is False
+        assert "blocked" in res["reason"]
+        assert "ta-lib is required" in res["reason"]
+
+    def test_a_long_blocked_list_is_bounded_with_a_truncation_marker(
+            self, tmp_path):
+        # N1: a ready row's ``blocked`` list can hold an entire repo's
+        # block dump (93 dict reprs in production); joining it unbounded
+        # copied 16 kB into ONE skip row -- 71% of the leaderboard. The
+        # reason must stay small while still naming the blocked entries,
+        # on both skip paths (RUN_* and NEEDS_HEAVY_ENV).
+        layout = self._layout(tmp_path)
+        blocked = [{"kind": "notebook", "path": f"nb_{i:03d}.ipynb",
+                    "reason": "ta-lib needs a C library (TA-Lib) that is "
+                              "not installed"} for i in range(93)]
+        row = {"repo": "owner/name", "status": "ready", "blocked": blocked,
+               "mode": "main", "venv": None, "env_key": "abc123"}
+        for verdict in ("RUN_WITH_OUR_DATA", "NEEDS_HEAVY_ENV"):
+            res = run_external.select_env(triage_row(verdict=verdict),
+                                          {"owner/name": row}, layout)
+            assert res["run"] is False
+            assert "env for owner/name is blocked:" in res["reason"]
+            assert "nb_092.ipynb" in res["reason"]   # still names entries
+            assert "...(truncated)" in res["reason"]
+            assert len(res["reason"]) < 400
+
+    def test_a_short_blocked_list_is_not_truncated(self, tmp_path):
+        # The bound must only bite when the list is long: a short blocked
+        # list is quoted in full (no marker, nothing dropped).
+        layout = self._layout(tmp_path)
+        row = {"repo": "owner/name", "status": "ready",
+               "blocked": [{"kind": "notebook", "path": "nb.ipynb",
+                            "reason": "ta-lib is required"}],
+               "mode": "main", "venv": None, "env_key": "abc123"}
+        res = run_external.select_env(triage_row(verdict="NEEDS_HEAVY_ENV"),
+                                      {"owner/name": row}, layout)
+        assert res["run"] is False
+        assert "...(truncated)" not in res["reason"]
+        assert "nb.ipynb" in res["reason"]
+        assert "ta-lib is required" in res["reason"]
+
+    def test_heavy_env_failed_row_keeps_the_root_cause_of_a_long_log(
+            self, tmp_path):
+        # A uv build failure is thousands of lines of download noise with the
+        # actual cause at the very end: the reason must keep that cause and
+        # must not copy the whole log into every leaderboard row.
+        layout = self._layout(tmp_path)
+        error = "Downloading scipy (40.2MiB)\n" * 200 + (
+            "error: [Errno 2] No such file or directory: 'cmake'\n")
+        row = {"repo": "owner/name", "status": "failed", "error": error,
+               "blocked": [], "mode": "repo-venv", "venv": None, "env_key": ""}
+        res = run_external.select_env(triage_row(verdict="NEEDS_HEAVY_ENV"),
+                                      {"owner/name": row}, layout)
+        assert res["run"] is False
+        assert "cmake" in res["reason"]
+        assert len(res["reason"]) < 1000
 
     def test_heavy_env_blocked_row_is_skipped_with_the_blocked_reason(self, tmp_path):
         layout = self._layout(tmp_path)
