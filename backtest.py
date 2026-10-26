@@ -172,7 +172,7 @@ def metrics(res: pd.DataFrame, col: str = "net") -> dict:
     cagr = eq.iloc[-1] ** (1 / yrs) - 1 if yrs > 0 and eq.iloc[-1] > 0 else np.nan
     vol = r.std() * np.sqrt(TRADING_DAYS)
     sharpe = (r.mean() / r.std() * np.sqrt(TRADING_DAYS)) if r.std() > 0 else np.nan
-    dd = (eq / eq.cummax() - 1).min()
+    dd = (eq / eq.cummax().clip(lower=1.0) - 1).min()
     trades = int((res["pos"].diff().abs() > 1e-9).sum())
     # t-stat on the mean daily net return: the honest significance number
     tstat = r.mean() / (r.std() / np.sqrt(len(r))) if r.std() > 0 else np.nan

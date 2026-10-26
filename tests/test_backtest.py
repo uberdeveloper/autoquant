@@ -649,3 +649,14 @@ class TestOHLCVContract:
 
         with pytest.raises(SystemExit, match="not in catalog"):
             backtest.load_prices("fred:NOPE_NOPE", None, None, tmp_path)
+
+
+@pytest.mark.parametrize('slice_start', [0, 2])
+def test_drawdown_includes_equity_before_first_return(slice_start):
+    idx = pd.bdate_range('2020-01-01', periods=6)
+    res = pd.DataFrame({'net': [0.1, 0.1, -0.5, 0, 0.01, 0],
+                        'pos': 1.0, 'cost': 0.0}, index=idx)
+    window = res if slice_start == 0 else res[res.index >= idx[slice_start]]
+    if slice_start == 0:
+        window = window.assign(net=[-0.5, 0, 0.01, 0, 0, 0])
+    assert backtest.metrics(window)['max_dd'] == -0.5
