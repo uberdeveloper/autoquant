@@ -61,7 +61,7 @@ class FakeUv:
         self.timeouts: list[int | None] = []
         self.fail_for = fail_for
 
-    def __call__(self, argv, timeout=None):
+    def __call__(self, argv, timeout=None, *, cwd=None):
         self.calls.append(list(argv))
         self.timeouts.append(timeout)
         if self.fail_for and any(self.fail_for in a for a in argv):
@@ -249,7 +249,7 @@ class TestBuildEnv:
                                 "# c\nnumpy==1.23.1\n-r other.txt\n"})
         seen = {}
 
-        def fake(argv, timeout=None):
+        def fake(argv, timeout=None, *, cwd=None):
             if argv[1] == "pip":
                 seen["text"] = Path(argv[-1]).read_text()
             return ""
@@ -855,7 +855,7 @@ class TestMainWithEdgeCases:
                          files={"requirements.txt": "numpy==1.23.1\n"})
         seen: dict = {}
 
-        def fake(argv, timeout=None):
+        def fake(argv, timeout=None, *, cwd=None):
             if argv[1] == "pip":
                 seen["parent"] = Path(argv[-1]).parent
             return ""
@@ -893,7 +893,7 @@ class TestMainWithEdgeCases:
                          "    - scipy==1.7.3\n"})
         seen: dict = {}
 
-        def fake(argv, timeout=None):
+        def fake(argv, timeout=None, *, cwd=None):
             if argv[1] == "pip":
                 seen["text"] = Path(argv[-1]).read_text()
             seen.setdefault("calls", []).append(list(argv))
@@ -1070,7 +1070,7 @@ class TestLegacyHandoffShape:
         calls: list[list[str]] = []
         seen: dict = {}
 
-        def fake(argv, timeout=None):
+        def fake(argv, timeout=None, *, cwd=None):
             calls.append(list(argv))
             if argv[1] == "venv":
                 # no pyvenv.cfg: the row then records the requested spec
@@ -1152,3 +1152,17 @@ class TestUvArgvFlags:
                            root=tmp_path)
         assert "--clear" in fake.calls[0]
         assert fake.calls[0][:3] == ["uv", "venv", "--no-project"]
+
+
+def test_uv_commands_resolve_local_dependencies_from_clone(tmp_path, monkeypatch):
+    dest = make_repo(tmp_path, deps={"requirements_txt": True},
+                     files={"requirements.txt": "./local-package\n"})
+    seen = []
+
+    def fake(argv, timeout=None, *, cwd=None):
+        seen.append(cwd)
+        return ""
+
+    monkeypatch.setattr(env_repo, 'run_uv', fake)
+    env_repo.build_env(dest, manifest_of(dest), 'local/repo', root=tmp_path)
+    assert seen == [dest.resolve(), dest.resolve()]

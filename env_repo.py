@@ -423,7 +423,8 @@ def plan_fallback(row: dict, error_text: str,
             "legacy_pins": list(LEGACY_PINS)}
 
 
-def run_uv(argv: list[str], timeout: int = UV_TIMEOUT) -> str:
+def run_uv(argv: list[str], timeout: int = UV_TIMEOUT, *,
+           cwd: Path | None = None) -> str:
     """Run a uv command, returning stripped stdout.
 
     This is the module's ONLY subprocess call site (mirroring
@@ -433,7 +434,7 @@ def run_uv(argv: list[str], timeout: int = UV_TIMEOUT) -> str:
     """
     try:
         r = subprocess.run(argv, capture_output=True, text=True, check=True,
-                           timeout=timeout)
+                           timeout=timeout, cwd=cwd)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError((exc.stderr or exc.stdout or
                             f"command failed: {' '.join(argv)}").strip()) from exc
@@ -538,7 +539,7 @@ def build_env(dest: Path, manifest: dict, label: str, *,
     an `environment.yml`, the conda `python=` pin that file declares; for
     every other repo, the explicit `python` argument or DEFAULT_PYTHON.
     """
-    dest = Path(dest)
+    dest = Path(dest).resolve()
     root = Path(root) if root is not None else ROOT
     st = state if state is not None else env_state(dest, manifest)
     source = st["deps_source"]
@@ -585,7 +586,7 @@ def build_env(dest: Path, manifest: dict, label: str, *,
     else:
         python_spec = python or DEFAULT_PYTHON
     run_uv(["uv", "venv", "--no-project", "--clear", "--python", python_spec,
-            str(venv)], timeout=timeout)
+            str(venv)], timeout=timeout, cwd=dest)
     req_file: Path | None = None
     try:
         fd, tmp_name = tempfile.mkstemp(prefix=".uv-requirements-",
@@ -595,7 +596,7 @@ def build_env(dest: Path, manifest: dict, label: str, *,
             fh.write("".join(line + "\n" for line in reqs))
         run_uv(["uv", "pip", "install", "--python",
                 str(venv / "bin" / "python"), "-r", str(req_file)],
-               timeout=timeout)
+               timeout=timeout, cwd=dest)
     finally:
         if req_file is not None:
             req_file.unlink(missing_ok=True)
