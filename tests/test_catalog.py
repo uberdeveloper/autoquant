@@ -275,9 +275,10 @@ class TestProvenance:
     def test_primary_fetch_records_source(self, tmp_path, monkeypatch):
         monkeypatch.setattr(catalog, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(catalog, "PROVENANCE", {})
-        url = ("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10")
-        fred = pd.DataFrame({"observation_date": ["2024-01-02"], "DGS10": ["4.0"]})
-        _stub_read_csv(monkeypatch, {url: fred})
+        from pandas_datareader.fred import FredReader
+        fred = pd.DataFrame({"DGS10": [4.0]},
+                            index=pd.to_datetime(["2024-01-02"]))
+        monkeypatch.setattr(FredReader, "read", lambda self: fred)
 
         catalog.load("fred:DGS10", None, None)
 

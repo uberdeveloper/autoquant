@@ -489,6 +489,8 @@ class TestMainCircuitBreaker:
         monkeypatch.setattr(extract, "SPECS", tmp_path / "specs")
         monkeypatch.setattr(extract, "PROMPT", tmp_path / "prompt.md")
 
+        monkeypatch.setattr(extract.llm, "preflight", lambda: None)
+
         def fake_complete(prompt, **k):
             raise llm.LLMError("opencode exited 1: auth expired")
 

@@ -173,6 +173,8 @@ class TestMainCircuitBreaker:
         monkeypatch.setattr(triage, "PROMPT", tmp_path / "prompt.md")
         (tmp_path / "prompt.md").write_text("RUBRIC")
 
+        monkeypatch.setattr(triage.llm, "preflight", lambda: None)
+
         def fake_complete(prompt, **k):
             raise llm.LLMError("opencode exited 1: auth expired")
 
