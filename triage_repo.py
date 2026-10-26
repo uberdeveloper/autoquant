@@ -161,12 +161,18 @@ def parse_json(text: str) -> dict:
     if fence:
         text = fence.group(1).strip()
     try:
-        return json.loads(text)
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
+        raise ValueError("JSON reply must be an object")
     except json.JSONDecodeError:
         pass
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end > start:
-        return json.loads(text[start:start + end - start + 1])
+        result = json.loads(text[start:start + end - start + 1])
+        if isinstance(result, dict):
+            return result
+        raise ValueError("JSON reply must be an object")
     raise ValueError(f"no JSON object in reply: {text[:200]!r}")
 
 
