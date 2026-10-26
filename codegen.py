@@ -108,16 +108,16 @@ def smoke_data(series_id: str) -> pd.DataFrame:
 
 
 def smoke_test(path: Path, params: dict, multi: bool = False,
-               df: pd.DataFrame | None = None) -> str | None:
+               df: pd.DataFrame | None = None,
+               data: dict[str, pd.DataFrame] | None = None) -> str | None:
     """Import the module and call signal on synthetic data. None = OK.
 
     multi=False: params are the signal kwargs; `df` defaults to a full
     OHLCV frame. Pass a source-shaped frame (e.g. close-only for FRED
     series) so a signal that indexes a column the source never provides
     fails here instead of crashing in backtest.run().
-    multi=True: params maps ticker -> OHLCV frame and is passed as `data`
-    itself; no signal kwargs are forwarded, which is safe because the multi
-    contract requires every parameter to have a default."""
+    multi=True: data maps ticker to source-shaped frames. In both modes,
+    params contains the configured signal keyword arguments."""
     name = f"strategies.{path.stem}"
     spec_ = importlib.util.spec_from_file_location(
         name, path,
@@ -128,8 +128,9 @@ def smoke_test(path: Path, params: dict, multi: bool = False,
         if not hasattr(mod, "signal"):
             return "defines no signal(df, **params)"
         if multi:
-            data = params
-            out = mod.signal(data)
+            if not data:
+                return "portfolio smoke data is empty"
+            out = mod.signal(data, **params)
         else:
             data = df if df is not None else smoke_frame()
             out = mod.signal(data, **params)
@@ -217,7 +218,8 @@ def publish(result: dict, spec: dict, strategies_dir: Path) -> str:
               if k not in ("definition", "lag_bars")}
     universe = list((spec.get("data") or {}).get("universe") or [])
     if len(universe) > 1:
-        err = smoke_test(tmp, {t: smoke_data(t) for t in universe}, multi=True)
+        err = smoke_test(tmp, params, multi=True,
+                         data={t: smoke_data(t) for t in universe})
     else:
         err = smoke_test(tmp, params, df=smoke_data(universe[0]) if universe else None)
     if err:
