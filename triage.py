@@ -37,6 +37,12 @@ CLI_TIMEOUT = 300
 
 STAGE_FOR = {5: "triaged", 4: "triaged", 3: "borderline",
              2: "rejected", 1: "rejected", 0: "rejected"}
+ASSET_CLASSES = {"equity_index", "single_equity", "futures", "fx", "crypto",
+                 "options", "rates", "multi", "unknown"}
+LIST_FIELDS = ("evidence", "missing", "red_flags")
+RED_FLAGS = {"no_costs_mentioned", "in_sample_only", "cherry_picked_window",
+             "fewer_than_30_trades", "fitted_parameters", "gross_results_only",
+             "suspiciously_late_start", "no_benchmark"}
 
 
 def load(path: Path) -> list[dict]:
@@ -78,19 +84,63 @@ def parse_json(text: str) -> dict:
     if fence:
         text = fence.group(1).strip()
     try:
-        return json.loads(text)
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
+        raise ValueError("JSON reply must be an object")
     except json.JSONDecodeError:
         pass
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end > start:
-        return json.loads(text[start:start + end - start + 1])
+        result = json.loads(text[start:start + end - start + 1])
+        if isinstance(result, dict):
+            return result
+        raise ValueError("JSON reply must be an object")
     raise ValueError(f"no JSON object in reply: {text[:200]!r}")
+
+
+def validate(result: dict) -> dict:
+    """Require the rubric's typed result before it can advance an article."""
+    score = result.get("score")
+    if score is not None and (isinstance(score, bool) or not isinstance(score, int)
+                              or score not in STAGE_FOR):
+        raise ValueError("invalid score")
+    if score is None:
+        if result.get("reason") != "text unavailable":
+            raise ValueError("invalid unavailable reason")
+        if any(result.get(key) is not None for key in
+               ("asset_class", "data_needed", "data_available", "est_effort", "claim")):
+            raise ValueError("invalid unavailable scalar fields")
+        if any(result.get(key) != [] for key in LIST_FIELDS):
+            raise ValueError("invalid unavailable list fields")
+        return result
+    if result.get("asset_class") not in ASSET_CLASSES:
+        raise ValueError("invalid asset_class")
+    if not isinstance(result.get("data_needed"), str):
+        raise ValueError("invalid data_needed")
+    if not isinstance(result.get("data_available"), bool):
+        raise ValueError("invalid data_available")
+    effort = result.get("est_effort")
+    if effort is not None and (isinstance(effort, bool) or not isinstance(effort, int) or effort < 0):
+        raise ValueError("invalid est_effort")
+    if not isinstance(result.get("claim"), str) or not isinstance(result.get("reason"), str):
+        raise ValueError("invalid claim or reason")
+    for key in LIST_FIELDS:
+        value = result.get(key)
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ValueError(f"invalid {key}")
+    if not set(result["red_flags"]).issubset(RED_FLAGS):
+        raise ValueError("invalid red_flags")
+    return result
 
 
 def score_one(row: dict, rubric: str, model: str | None,
               extra: list[str] | None = None) -> dict:
-    page = ROOT / row["page"]
-    prompt = build_prompt(rubric, row, strip_body(page))
+    try:
+        page = ROOT / row["page"]
+        prompt = build_prompt(rubric, row, strip_body(page))
+    except (KeyError, OSError) as exc:
+        return {"url": row.get("url"), "error": f"unreadable article: {exc}"[:300]}
 
     try:
         reply = llm.complete(prompt, model=model, extra=extra,
@@ -102,6 +152,10 @@ def score_one(row: dict, rubric: str, model: str | None,
         result = parse_json(reply)
     except (ValueError, json.JSONDecodeError) as exc:
         return {"url": row["url"], "error": f"unparseable reply: {exc}"[:300]}
+    try:
+        result = validate(result)
+    except ValueError as exc:
+        return {"url": row["url"], "error": str(exc)}
 
     result["url"] = row["url"]
     result["title"] = row["title"]
@@ -133,7 +187,10 @@ def main_with(argv: list[str] | None = None) -> int:
     scored = load(TRIAGE)
     seen = set() if args.rescore else {r["url"] for r in scored}
 
-    todo = [r for r in rows if r.get("stage") == "fetched" and r["url"] not in seen]
+    rescore_stages = {"triaged", "borderline", "rejected", "untriageable", "triage_failed"}
+    todo = [r for r in rows if r.get("stage") == "fetched" or
+            (args.rescore and r.get("stage") in rescore_stages)]
+    todo = [r for r in todo if r.get("url") not in seen]
     if args.limit:
         todo = todo[:args.limit]
     if not todo:

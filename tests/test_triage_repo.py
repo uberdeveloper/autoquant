@@ -256,6 +256,10 @@ class TestParseJson:
         with pytest.raises(ValueError, match="no JSON object"):
             triage_repo.parse_json("there is nothing here")
 
+    def test_array_reply_is_rejected(self):
+        with pytest.raises(ValueError, match="object"):
+            triage_repo.parse_json('[{"verdict": "SKIP"}]')
+
 
 class TestBuildPrompt:
     def test_starts_with_rubric_and_carries_payload(self):

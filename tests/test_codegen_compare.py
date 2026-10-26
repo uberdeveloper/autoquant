@@ -139,3 +139,16 @@ class TestPerLabelCircuitBreaker:
         assert len(list((strategies / "compare" / "bad").glob("*.error"))) == 3
         # good label completed all 5
         assert len(list((strategies / "compare" / "good").glob("*.py"))) == 5
+
+
+def test_compare_preflights_only_selected_commands(tmp_path, monkeypatch):
+    wire(tmp_path, monkeypatch, lambda prompt, **kwargs: VALID_MODULE)
+    setup_specs(tmp_path)
+    checked = []
+    def unavailable_default():
+        raise llm.LLMError('opencode unavailable')
+    monkeypatch.setattr(codegen.llm, 'preflight', unavailable_default)
+    monkeypatch.setattr(codegen.llm, 'preflight_for', checked.append)
+    assert codegen.main_with(['--jobs', '1', '--compare-models', 'c=claude -p']) == 0
+    assert checked == ['claude -p']
+    assert (tmp_path / 'strategies' / 'compare' / 'c' / 's0.py').exists()

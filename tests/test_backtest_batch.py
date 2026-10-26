@@ -101,7 +101,7 @@ class TestRunOne:
         ]
         spec = tmp_path / "s.yaml"
         spec.write_text("meta:\n  slug: s\n")
-        monkeypatch.setattr(backtest_batch, "_backtest_cmd", lambda s: wrapper)
+        monkeypatch.setattr(backtest_batch, "_backtest_cmd", lambda s, n=None: wrapper)
 
         result = backtest_batch.run_one(spec, 2)
         assert "timed out" in result["error"]
@@ -156,7 +156,7 @@ class TestMain:
         monkeypatch.setattr(backtest_batch, "LEADERBOARD", tmp_path / "results" / "leaderboard.jsonl")
         monkeypatch.setattr(backtest_batch, "FAILED", tmp_path / "results" / "failed.jsonl")
 
-        def fake_run_one(spec, timeout):
+        def fake_run_one(spec, timeout, n_trials=None):
             ran.append(spec.name)
             if spec.name == "a.yaml":
                 return {"spec": str(spec), "output": "a: Sharpe 0.4 net\n"}
@@ -174,6 +174,21 @@ class TestMain:
         assert "1 ok, 1 failed" in capsys.readouterr().out
         assert sorted(ran) == ["a.yaml", "b.yaml"]
 
+    def test_batch_passes_one_unique_slug_snapshot_to_every_worker(self, tmp_path, monkeypatch):
+        seen = []
+        self._patch(tmp_path, monkeypatch, [])
+        leaderboard = tmp_path / "results" / "leaderboard.jsonl"
+        leaderboard.parent.mkdir(exist_ok=True)
+        leaderboard.write_text('{"slug": "already"}\n{"slug": "already"}\n')
+
+        def fake_run_one(spec, timeout, n_trials=None):
+            seen.append(n_trials)
+            return {"spec": str(spec), "output": "ok\n"}
+
+        monkeypatch.setattr(backtest_batch, "run_one", fake_run_one)
+        assert backtest_batch.main_with(["--jobs", "1"]) == 0
+        assert seen == [3, 3]
+
     def test_resume_skips_specs_already_in_leaderboard(self, tmp_path, monkeypatch):
         ran = []
         self._patch(tmp_path, monkeypatch, ran)
@@ -182,6 +197,19 @@ class TestMain:
         lb.write_text('{"slug": "a"}\n')  # a is already done
         assert backtest_batch.main_with(["--jobs", "1"]) == 0
         assert ran == ["b.yaml"]  # only the un-run spec executed
+
+    def test_duplicate_pending_slug_is_recorded_without_rescheduling(self, tmp_path, monkeypatch):
+        ran = []
+        self._patch(tmp_path, monkeypatch, ran)
+        duplicate = tmp_path / "specs" / "z_duplicate.yaml"
+        duplicate.write_text("meta:\n  slug: a\n")
+
+        assert backtest_batch.main_with(["--jobs", "1"]) == 0
+
+        assert ran == ["a.yaml", "b.yaml"]
+        failed = (tmp_path / "results" / "failed.jsonl").read_text()
+        assert "z_duplicate.yaml" in failed
+        assert "duplicate meta.slug" in failed
 
     def test_malformed_spec_does_not_abort_batch(self, tmp_path, monkeypatch):
         ran = []

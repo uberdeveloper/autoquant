@@ -37,6 +37,7 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 ARXIV = "{http://arxiv.org/schemas/atom}"
 PAGE_SIZE = 100
 HARD_CAP = 1000
+MAX_CONSECUTIVE_KNOWN_PAGES = 10
 DEFAULT_CATEGORIES = "q-fin*,econ.EM,econ.GN"
 DEFAULT_LIMIT = 100
 
@@ -157,6 +158,7 @@ def main_with(argv: list[str] | None = None) -> int:
 
     query = search_query(cats)
     new = 0
+    consecutive_known_pages = 0
     with args.out.open("a") as fh:
         start = 0
         while new < limit:
@@ -165,11 +167,13 @@ def main_with(argv: list[str] | None = None) -> int:
                    f"&sortBy=submittedDate&sortOrder=descending"
                    f"&start={start}&max_results={want}")
             try:
-                rows = parse_atom(get(session, url))
+                response_text = get(session, url)
+                raw_entries = len(ET.fromstring(response_text).findall(ATOM + "entry"))
+                rows = parse_atom(response_text)
             except Exception as exc:
                 print(f"api start={start}: {exc}", file=sys.stderr)
                 break
-            if not rows:
+            if raw_entries == 0:
                 break  # exhausted
             added = 0
             for row in rows:
@@ -182,10 +186,22 @@ def main_with(argv: list[str] | None = None) -> int:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
                 added += 1
                 new += 1
+            if added:
+                consecutive_known_pages = 0
+            else:
+                consecutive_known_pages += 1
             print(f"start={start}: {len(rows)} entries, {added} new")
-            if added == 0:
-                break  # everything on this page is already known -> done
-            start += PAGE_SIZE
+            # A known page does not mean later pages are known. Continue until
+            # the API returns a short page or no entries.
+            if consecutive_known_pages >= MAX_CONSECUTIVE_KNOWN_PAGES:
+                print(
+                    "stopping after "
+                    f"{consecutive_known_pages} consecutive pages with no new papers"
+                )
+                break
+            if raw_entries < want:
+                break
+            start += want
             time.sleep(args.sleep)
 
     print(f"\n{new} new articles -> {args.out}")
