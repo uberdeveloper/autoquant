@@ -342,10 +342,11 @@ def main_with(argv: list[str] | None = None) -> int:
             sys.exit(f"error: {exc}")
 
     try:
-        llm.preflight()
         if candidates:
             for _label, cmd in candidates:
                 llm.preflight_for(cmd)
+        else:
+            llm.preflight()
     except llm.LLMError as exc:
         sys.exit(f"error: {exc}")
 
