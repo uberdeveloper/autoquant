@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -197,9 +198,14 @@ def cache_path(series_id: str) -> Path:
 def _write_cache(cache: Path, df: pd.DataFrame) -> None:
     """Tmp + replace: an interrupted write can never shadow real data."""
     cache.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cache.with_suffix(".csv.tmp")
-    df.to_csv(tmp)
-    tmp.replace(cache)
+    with tempfile.NamedTemporaryFile(dir=cache.parent, prefix=cache.name + ".",
+                                     suffix=".tmp", delete=False) as handle:
+        tmp = Path(handle.name)
+    try:
+        df.to_csv(tmp)
+        tmp.replace(cache)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _entry_for(series_id: str) -> dict:

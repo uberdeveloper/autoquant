@@ -407,3 +407,29 @@ class TestMinors:
     def test_every_entry_has_a_license(self):
         for entry in catalog._index()["series"]:
             assert entry.get("license"), f"{entry['id']} missing license"
+
+
+def test_concurrent_cache_writers_publish_complete_files(tmp_path, monkeypatch):
+    import concurrent.futures
+    import threading
+
+    barrier = threading.Barrier(2)
+    original = pd.DataFrame.to_csv
+
+    def overlapping_write(self, path, *args, **kwargs):
+        result = original(self, path, *args, **kwargs)
+        barrier.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(pd.DataFrame, 'to_csv', overlapping_write)
+    path = tmp_path / 'shared.csv'
+    frames = [pd.DataFrame({'close': [value, value]},
+                           index=pd.date_range('2024-01-01', periods=2))
+              for value in (10.0, 20.0)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(catalog._write_cache, path, frame) for frame in frames]
+        for future in futures:
+            future.result()
+    values = pd.read_csv(path)['close']
+    assert values.eq(10.0).all() or values.eq(20.0).all()
+    assert list(tmp_path.iterdir()) == [path]

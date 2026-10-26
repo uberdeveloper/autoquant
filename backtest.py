@@ -53,7 +53,7 @@ def load_prices(ticker: str, start, end, cache_dir: Path) -> pd.DataFrame:
 
         df = yf.download(ticker, start="1990-01-01", auto_adjust=True, progress=False)
         df = catalog.normalize_yahoo(df)
-        df.to_csv(cache)
+        catalog._write_cache(cache, df)
     if start:
         df = df[df.index >= pd.Timestamp(start)]
     if end:
