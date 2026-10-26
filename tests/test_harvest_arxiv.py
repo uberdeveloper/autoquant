@@ -189,3 +189,17 @@ class TestMain:
                                  "--sleep", "0", "--limit", "2"])
         assert any("start=2" in url for url in calls)
         assert len(out.read_text().splitlines()) == 4
+
+    def test_stops_after_bounded_known_pages(self, tmp_path, monkeypatch):
+        out, pages, calls = self._wire(tmp_path, monkeypatch)
+        monkeypatch.setattr(harvest_arxiv, "PAGE_SIZE", 2)
+        monkeypatch.setattr(harvest_arxiv, "MAX_CONSECUTIVE_KNOWN_PAGES", 2)
+        known = harvest_arxiv.parse_atom(ATOM_PAGE)
+        out.write_text("".join(json.dumps(row) + "\n" for row in known))
+
+        harvest_arxiv.main_with(
+            ["--out", str(out), "--pages", str(pages), "--sleep", "0", "--limit", "2"]
+        )
+
+        assert len(calls) == 2
+        assert len(out.read_text().splitlines()) == 2
