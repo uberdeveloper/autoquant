@@ -167,6 +167,16 @@ class TestBacktestMulti:
         with pytest.raises(ValueError, match="identical trading calendars"):
             backtest.backtest_multi(data, weights, spec)
 
+    def test_market_neutral_portfolio_reports_gross_exposure_and_leg_trades(self):
+        data = make_panel()
+        weights = pd.DataFrame({"AAA": 0.5, "BBB": -0.5}, index=data["AAA"].index)
+        result = backtest.backtest_multi(data, weights, MULTI_SPEC)
+        summary = backtest.metrics(result)
+        assert result["gross_exposure"].to_numpy()[1] == pytest.approx(1.0)
+        assert {"position__AAA", "position__BBB", "return__AAA", "return__BBB"} <= set(result)
+        assert summary["exposure"] > 0.9
+        assert summary["trades"] == 2
+
     def test_missing_weight_columns_filled_zero(self):
         data = make_panel()
         w = pd.DataFrame({"AAA": 1.0}, index=data["AAA"].index)

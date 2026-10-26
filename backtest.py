@@ -127,9 +127,12 @@ def backtest(df: pd.DataFrame, weights: pd.Series, spec: dict) -> pd.DataFrame:
     )
 
     gross = pos * asset_ret
+    trade_events = pos.ne(pos.shift()).where(pos.shift().notna(), pos.ne(0)).astype(int)
     return pd.DataFrame(
         {"pos": pos, "asset_ret": asset_ret, "gross": gross,
-         "cost": cost + carry, "net": gross - cost - carry}
+         "cost": cost + carry, "net": gross - cost - carry,
+         "position__asset": pos, "return__asset": asset_ret,
+         "gross_exposure": pos.abs(), "trade_events": trade_events}
     )
 
 
@@ -168,16 +171,23 @@ def backtest_multi(data: dict[str, pd.DataFrame], weights: pd.DataFrame,
         rets = pd.DataFrame({t: df["close"].pct_change().fillna(0.0)
                              for t, df in data.items()})
 
-    turnover = pos_frame.diff().abs()
-    turnover.iloc[0] = pos_frame.iloc[0].abs()
+    turnover = pos_frame.diff().abs().fillna(pos_frame.abs())
     per_side = (costs.get("commission_bps", 0) + costs.get("slippage_bps", 0)) / 1e4
     cost = turnover.sum(axis=1) * per_side
 
     gross = (pos_frame * rets.reindex(columns=pos_frame.columns)).sum(axis=1)
     total = pos_frame.sum(axis=1)
     port_ret = (gross / total.where(total != 0)).fillna(0.0)
-    return pd.DataFrame({"pos": total, "asset_ret": port_ret, "gross": gross,
-                         "cost": cost, "net": gross - cost})
+    previous = pos_frame.shift()
+    trade_events = pos_frame.ne(previous).where(previous.notna(), pos_frame.ne(0)).sum(axis=1)
+    result = pd.DataFrame({"pos": total, "asset_ret": port_ret, "gross": gross,
+                           "cost": cost, "net": gross - cost,
+                           "gross_exposure": pos_frame.abs().sum(axis=1),
+                           "trade_events": trade_events})
+    for ticker in pos_frame:
+        result[f"position__{ticker}"] = pos_frame[ticker]
+        result[f"return__{ticker}"] = rets[ticker]
+    return result
 
 
 def metrics(res: pd.DataFrame, col: str = "net") -> dict:
@@ -190,7 +200,7 @@ def metrics(res: pd.DataFrame, col: str = "net") -> dict:
     vol = r.std() * np.sqrt(TRADING_DAYS)
     sharpe = (r.mean() / r.std() * np.sqrt(TRADING_DAYS)) if r.std() > 0 else np.nan
     dd = (eq / eq.cummax().clip(lower=1.0) - 1).min()
-    trades = int((res["pos"].diff().abs() > 1e-9).sum())
+    trades = int(res["trade_events"].sum()) if "trade_events" in res else int((res["pos"].diff().abs() > 1e-9).sum())
     # t-stat on the mean daily net return: the honest significance number
     tstat = r.mean() / (r.std() / np.sqrt(len(r))) if r.std() > 0 else np.nan
     return {
@@ -199,14 +209,15 @@ def metrics(res: pd.DataFrame, col: str = "net") -> dict:
         "cagr": round(float(cagr), 4), "vol": round(float(vol), 4),
         "sharpe": round(float(sharpe), 3), "max_dd": round(float(dd), 4),
         "t_stat": round(float(tstat), 2),
-        "exposure": round(float(res["pos"].abs().mean()), 3),
+        "exposure": round(float((res["gross_exposure"] if "gross_exposure" in res else res["pos"].abs()).mean()), 3),
         "trades": trades,
         "cost_drag_annual": round(float(res["cost"].mean() * TRADING_DAYS), 4),
     }
 
 
 def buy_and_hold(res: pd.DataFrame) -> dict:
-    bh = res.assign(pos=1.0, net=res["asset_ret"], cost=0.0)
+    bh = res.assign(pos=1.0, net=res["asset_ret"], cost=0.0,
+                    gross_exposure=1.0, trade_events=0)
     m = metrics(bh)
     m["trades"] = 1
     return m
