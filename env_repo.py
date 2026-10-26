@@ -62,6 +62,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -423,6 +424,14 @@ def plan_fallback(row: dict, error_text: str,
             "legacy_pins": list(LEGACY_PINS)}
 
 
+def _kill_process_group(pid: int) -> None:
+    """Best-effort termination of the process group led by *pid*."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def run_uv(argv: list[str], timeout: int = UV_TIMEOUT, *,
            cwd: Path | None = None) -> str:
     """Run a uv command, returning stripped stdout.
@@ -433,17 +442,28 @@ def run_uv(argv: list[str], timeout: int = UV_TIMEOUT, *,
     printed.
     """
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, check=True,
-                           timeout=timeout, cwd=cwd)
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError((exc.stderr or exc.stdout or
-                            f"command failed: {' '.join(argv)}").strip()) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"uv timed out after {timeout}s: "
-                           f"{' '.join(argv)}") from exc
+        process = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+            start_new_session=True,
+        )
     except FileNotFoundError as exc:
         raise RuntimeError(f"uv not found on PATH: {' '.join(argv)}") from exc
-    return (r.stdout or "").strip()
+
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill_process_group(process.pid)
+        process.communicate()
+        raise RuntimeError(f"uv timed out after {timeout}s: "
+                           f"{' '.join(argv)}") from exc
+    if process.returncode:
+        raise RuntimeError((stderr or stdout or
+                            f"command failed: {' '.join(argv)}").strip())
+    return (stdout or "").strip()
 
 
 def _environment_yml_parses(text: str) -> bool:

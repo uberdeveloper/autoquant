@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -717,29 +720,66 @@ class TestRunUvErrors:
     """T2: the subprocess failure contract of the only uv call site."""
 
     def test_called_process_error_reports_stderr(self, monkeypatch):
-        def fake_run(argv, **kwargs):
-            raise subprocess.CalledProcessError(1, argv, output="",
-                                                stderr="boom stderr")
-        monkeypatch.setattr(env_repo.subprocess, "run", fake_run)
+        class FakeProcess:
+            returncode = 1
+
+            def communicate(self, timeout=None):
+                return "", "boom stderr"
+
+        monkeypatch.setattr(env_repo.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
         with pytest.raises(RuntimeError) as exc:
             env_repo.run_uv(["uv", "venv"])
         assert "boom stderr" in str(exc.value)
 
     def test_timeout_is_reported(self, monkeypatch):
-        def fake_run(argv, **kwargs):
-            raise subprocess.TimeoutExpired(argv, 5)
-        monkeypatch.setattr(env_repo.subprocess, "run", fake_run)
+        class FakeProcess:
+            pid = 123
+            returncode = -9
+
+            def communicate(self, timeout=None):
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired(["uv", "venv"], timeout)
+                return "", ""
+
+        killed: list[int] = []
+        monkeypatch.setattr(env_repo.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+        monkeypatch.setattr(env_repo, "_kill_process_group", killed.append)
         with pytest.raises(RuntimeError) as exc:
             env_repo.run_uv(["uv", "venv"], timeout=5)
         assert "uv timed out after 5s" in str(exc.value)
+        assert killed == [123]
 
     def test_missing_uv_is_reported(self, monkeypatch):
-        def fake_run(argv, **kwargs):
+        def fake_popen(argv, **kwargs):
             raise FileNotFoundError(2, "No such file or directory")
-        monkeypatch.setattr(env_repo.subprocess, "run", fake_run)
+        monkeypatch.setattr(env_repo.subprocess, "Popen", fake_popen)
         with pytest.raises(RuntimeError) as exc:
             env_repo.run_uv(["uv", "venv"])
         assert "uv not found on PATH" in str(exc.value)
+
+    def test_timeout_kills_child_process_group(self, tmp_path):
+        child_pid = tmp_path / "child.pid"
+        wrapper = (
+            "import subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "Path(sys.argv[1]).write_text(str(child.pid))\n"
+            "time.sleep(60)\n"
+        )
+
+        with pytest.raises(RuntimeError, match="uv timed out"):
+            env_repo.run_uv([sys.executable, "-c", wrapper, str(child_pid)], timeout=0.1)
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if child_pid.exists():
+                try:
+                    os.kill(int(child_pid.read_text()), 0)
+                except ProcessLookupError:
+                    break
+            time.sleep(0.02)
+        else:
+            pytest.fail("timed-out command left its child process running")
 
 
 class TestMainWithEdgeCases:
