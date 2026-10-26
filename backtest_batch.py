@@ -108,6 +108,7 @@ def main_with(argv: list[str] | None = None) -> int:
     ok = failed = 0
     specs = []
     scheduled_slugs: set[str] = set()
+    scheduled_paths: dict[str, Path] = {}
     for path in sorted(args.specs.glob("*.yaml")):
         try:
             slug = yaml.safe_load(path.read_text())["meta"]["slug"]
@@ -116,9 +117,19 @@ def main_with(argv: list[str] | None = None) -> int:
             record_failure({"spec": str(path), "error": f"bad spec: {exc}"}, FAILED)
             print(f"FAIL    bad spec: {str(exc)[:60]:<60}  {path}")
             continue
-        if slug not in done:
-            specs.append(path)
-            scheduled_slugs.add(slug)
+        if slug in done:
+            continue
+        if slug in scheduled_paths:
+            failed += 1
+            original = scheduled_paths[slug]
+            error = (f"duplicate meta.slug {slug!r}; "
+                     f"already scheduled from {original}")
+            record_failure({"spec": str(path), "error": error}, FAILED)
+            print(f"FAIL    {error[:60]:<60}  {path}")
+            continue
+        specs.append(path)
+        scheduled_slugs.add(slug)
+        scheduled_paths[slug] = path
     if not specs:
         if failed:
             print(f"\n{ok} ok, {failed} failed (see {FAILED.relative_to(ROOT)})")

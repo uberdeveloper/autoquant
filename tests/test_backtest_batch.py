@@ -198,6 +198,19 @@ class TestMain:
         assert backtest_batch.main_with(["--jobs", "1"]) == 0
         assert ran == ["b.yaml"]  # only the un-run spec executed
 
+    def test_duplicate_pending_slug_is_recorded_without_rescheduling(self, tmp_path, monkeypatch):
+        ran = []
+        self._patch(tmp_path, monkeypatch, ran)
+        duplicate = tmp_path / "specs" / "z_duplicate.yaml"
+        duplicate.write_text("meta:\n  slug: a\n")
+
+        assert backtest_batch.main_with(["--jobs", "1"]) == 0
+
+        assert ran == ["a.yaml", "b.yaml"]
+        failed = (tmp_path / "results" / "failed.jsonl").read_text()
+        assert "z_duplicate.yaml" in failed
+        assert "duplicate meta.slug" in failed
+
     def test_malformed_spec_does_not_abort_batch(self, tmp_path, monkeypatch):
         ran = []
         self._patch(tmp_path, monkeypatch, ran)
