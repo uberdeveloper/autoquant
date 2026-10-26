@@ -81,6 +81,15 @@ class TestSmokeTest:
         assert codegen.smoke_test(f, {"lookback": 10}) is None
         assert codegen.smoke_test(f, {}) is not None
 
+    def test_hanging_module_times_out_without_blocking_runner(self, tmp_path, monkeypatch):
+        f = self.write_module(tmp_path, "while True:\n    pass\n")
+        monkeypatch.setattr(codegen, "SMOKE_TIMEOUT", 0.1)
+        assert "timed out" in codegen.smoke_test(f, {})
+
+    def test_system_exit_is_a_smoke_failure(self, tmp_path):
+        f = self.write_module(tmp_path, "raise SystemExit(0)\n")
+        assert "smoke worker failed" in codegen.smoke_test(f, {})
+
 
 class TestStripFence:
     def test_bare_source(self):

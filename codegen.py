@@ -22,8 +22,12 @@ import importlib.util
 import json
 import llm
 import os
+import pickle
 import re
+import signal
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -38,6 +42,7 @@ STRATEGIES = ROOT / "strategies"
 COMPARE = STRATEGIES / "compare"
 
 CLI_TIMEOUT = 600
+SMOKE_TIMEOUT = 30
 
 CONTRACT_SINGLE = """\
 Write a Python module implementing the strategy spec below.
@@ -107,9 +112,9 @@ def smoke_data(series_id: str) -> pd.DataFrame:
     return frame
 
 
-def smoke_test(path: Path, params: dict, multi: bool = False,
-               df: pd.DataFrame | None = None,
-               data: dict[str, pd.DataFrame] | None = None) -> str | None:
+def _smoke_test_inline(path: Path, params: dict, multi: bool = False,
+                       df: pd.DataFrame | None = None,
+                       data: dict[str, pd.DataFrame] | None = None) -> str | None:
     """Import the module and call signal on synthetic data. None = OK.
 
     multi=False: params are the signal kwargs; `df` defaults to a full
@@ -154,6 +159,52 @@ def smoke_test(path: Path, params: dict, multi: bool = False,
     if not np.isfinite(pd.to_numeric(out, errors="coerce")).all():
         return "signal returned non-finite values"
     return None
+
+
+def _smoke_worker(input_path: str, output_path: str) -> None:
+    """Run one smoke test in a child interpreter and publish JSON only."""
+    with Path(input_path).open("rb") as fh:
+        args = pickle.load(fh)
+    error = _smoke_test_inline(**args)
+    Path(output_path).write_text(json.dumps({"error": error}))
+
+
+def smoke_test(path: Path, params: dict, multi: bool = False,
+               df: pd.DataFrame | None = None,
+               data: dict[str, pd.DataFrame] | None = None) -> str | None:
+    """Smoke-test generated source in a bounded child process."""
+    args = {"path": path, "params": params, "multi": multi,
+            "df": df, "data": data}
+    with tempfile.TemporaryDirectory(prefix="codegen-smoke-") as temp_dir:
+        temp = Path(temp_dir)
+        input_path = temp / "input.pkl"
+        output_path = temp / "result.json"
+        with input_path.open("wb") as fh:
+            pickle.dump(args, fh)
+        command = ["uv", "run", "--no-sync", "python", "-c",
+                   "from codegen import _smoke_worker; import sys; "
+                   "_smoke_worker(sys.argv[1], sys.argv[2])",
+                   str(input_path), str(output_path)]
+        try:
+            process = subprocess.Popen(command, cwd=Path(__file__).resolve().parent,
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL,
+                                       start_new_session=True)
+            process.wait(timeout=SMOKE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            return f"smoke test timed out after {SMOKE_TIMEOUT}s"
+        except OSError as exc:
+            return f"smoke worker failed to start: {type(exc).__name__}: {exc}"
+        try:
+            result = json.loads(output_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"smoke worker failed: {type(exc).__name__}: {exc}"
+        error = result.get("error") if isinstance(result, dict) else None
+        if not isinstance(error, (str, type(None))):
+            return "smoke worker returned an invalid result"
+        return error
 
 
 def _write_atomic(path: Path, text: str) -> None:
