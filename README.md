@@ -118,8 +118,8 @@ Automated flags and the leaderboard):
 
 - monthly/vintage series (e.g. `fred:CPIAUCSL`) are released after the
   period they describe — using them directly gives lookahead bias;
-- a catalog series whose frequency differs from `data.bar` (e.g. a monthly
-  series in a daily panel) distorts Sharpe through phantom bars.
+- the harness supports daily bars only (`data.bar: 1d`); a catalog series
+  with another frequency (e.g. monthly) distorts Sharpe through phantom bars.
 
 Strategies that run with `execution_price: next_open` require an `open`
 column; close-only FRED series are rejected with a clear message, and the

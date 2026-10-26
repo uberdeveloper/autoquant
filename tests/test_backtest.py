@@ -428,6 +428,13 @@ class TestWriteReport:
 
 
 class TestEndToEndRun:
+    def test_run_rejects_non_daily_data_before_loading_strategy(self, monkeypatch):
+        monkeypatch.setattr(backtest, "load_strategy", lambda slug: pytest.fail("loaded"))
+        spec = {"meta": {"slug": "intraday"}, "data": {"bar": "1h"}}
+
+        with pytest.raises(SystemExit, match="daily bars"):
+            backtest.run_spec(spec, None)
+
     def test_run_on_cached_prices_and_local_strategy(self, tmp_path, monkeypatch):
         monkeypatch.setattr(backtest, "ROOT", tmp_path)
 
@@ -451,7 +458,7 @@ class TestEndToEndRun:
                 "author_evidence": {"headline_metrics": "n/a", "sample": "n/a",
                                     "costs_included": False},
             },
-            "data": {"universe": ["SPY_TEST"], "start": "2020-01-01"},
+            "data": {"universe": ["SPY_TEST"], "bar": "1d", "start": "2020-01-01"},
             "signal": {"definition": "always long", "lag_bars": 1},
             "rules": {"max_leverage": 1.0},
             "costs": {"commission_bps": 5, "slippage_bps": 5},
@@ -505,7 +512,7 @@ class TestMultiUniverseRun:
                 "author_evidence": {"headline_metrics": "n/a", "sample": "n/a",
                                     "costs_included": False},
             },
-            "data": {"universe": ["AAA", "BBB"], "start": "2020-01-01"},
+            "data": {"universe": ["AAA", "BBB"], "bar": "1d", "start": "2020-01-01"},
             "signal": {"definition": "equal weight", "lag_bars": 1},
             "rules": {"max_leverage": 1.0},
             "costs": {"commission_bps": 5, "slippage_bps": 5},
@@ -670,7 +677,7 @@ class TestOHLCVContract:
             "rules": {"execution_price": "next_open"},
             "costs": {"commission_bps": 10, "slippage_bps": 10},
             "validation": {},
-            "data": {"universe": ["fred:DGS10"], "start": "2020-01-01"},
+            "data": {"universe": ["fred:DGS10"], "bar": "1d", "start": "2020-01-01"},
         }
         idx = pd.bdate_range("2020-01-01", periods=60)
         close = pd.DataFrame({"close": np.linspace(100, 110, 60)}, index=idx)

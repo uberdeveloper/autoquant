@@ -17,7 +17,7 @@ VALID_SPEC = {
         "author_evidence": {"sample": "s", "headline_metrics": "m",
                             "costs_included": False},
     },
-    "data": {"universe": ["SPY"], "start": "1993-01-01"},
+    "data": {"universe": ["SPY"], "bar": "1d", "start": "1993-01-01"},
     "signal": {"definition": "close > sma200", "lag_bars": 1},
     "rules": {"direction": "long_only"},
     "costs": {"commission_bps": 1.0, "slippage_bps": 5.0},
@@ -89,6 +89,11 @@ class TestValidateSpec:
         doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
         doc["data"]["universe"] = ["spy"]
         assert any("universe" in e for e in extract.validate_spec(doc, "test-slug"))
+
+    def test_non_daily_bar_rejected(self):
+        doc = yaml.safe_load(yaml.safe_dump(VALID_SPEC))
+        doc["data"]["bar"] = "1h"
+        assert any("data.bar" in e for e in extract.validate_spec(doc, "test-slug"))
 
     def test_matching_slug_accepted(self):
         assert extract.validate_spec(VALID_SPEC, "test-slug") == []

@@ -115,6 +115,8 @@ def validate_spec(doc: dict, expected_slug: str) -> list[str]:
 
     data = doc.get("data")
     uni = data.get("universe") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or data.get("bar") != "1d":
+        errors.append("data.bar must be exactly '1d'; intraday bars are unsupported")
 
     def ticker_ok(t) -> bool:
         if not isinstance(t, str):

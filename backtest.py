@@ -297,6 +297,8 @@ def run(spec_path: Path, n_trials: int | None) -> dict:
 
 
 def run_spec(spec: dict, n_trials: int | None) -> dict:
+    if spec.get("data", {}).get("bar") != "1d":
+        sys.exit("only daily bars are supported; set data.bar: 1d")
     slug = spec["meta"]["slug"]
     mod = load_strategy(slug)
 
