@@ -294,6 +294,21 @@ class TestRandomEntryNull:
         b = backtest.random_entry_null(res, BASE_SPEC, n=30, seed=7)
         assert a == b
 
+    def test_portfolio_null_shuffles_complete_position_rows(self):
+        index = pd.date_range("2024-01-01", periods=4, freq="D")
+        res = pd.DataFrame({
+            "position__long": [0.5, 1.0, 0.0, 0.5],
+            "position__short": [-0.5, -1.0, 0.0, -0.5],
+            "return__long": [0.01, -0.02, 0.03, -0.01],
+            "return__short": [-0.01, 0.02, -0.03, 0.01],
+            "net": [0.01, -0.02, 0.03, -0.01],
+        }, index=index)
+
+        out = backtest.random_entry_null(res, BASE_SPEC, n=20, seed=3)
+
+        assert "actual_sharpe" in out
+        assert 0 <= out["percentile"] <= 100
+
 
 class TestAutoFlags:
     def make_out(self, sharpe=1.0, bh_sharpe=0.5, trades=100, oos_sharpe=0.8,

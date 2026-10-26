@@ -226,27 +226,36 @@ def buy_and_hold(res: pd.DataFrame) -> dict:
 # ---------------------------------------------------------------- validation
 
 def random_entry_null(res: pd.DataFrame, spec: dict, n: int = 500, seed: int = 0) -> dict:
-    """Same time-in-market, random timing. Where does the real Sharpe rank?"""
+    """Jointly shuffle observed position rows, preserving each portfolio state."""
     rng = np.random.default_rng(seed)
-    exposure = float(res["pos"].abs().mean())
     n_bars = len(res)
-    k = int(round(exposure * n_bars))
-    if k == 0 or k == n_bars:
-        return {"note": "degenerate exposure — null test not meaningful"}
-    ret = res["asset_ret"].to_numpy()
+    position_columns = [col for col in res if col.startswith("position__")]
+    portfolio_return_columns = [f"return__{col.removeprefix('position__')}" for col in position_columns]
+    if position_columns and all(col in res for col in portfolio_return_columns):
+        positions = res[position_columns].to_numpy(float)
+        returns = res[portfolio_return_columns].to_numpy(float)
+    else:
+        positions = res[["pos"]].to_numpy(float)
+        returns = res[["asset_ret"]].to_numpy(float)
+    if n_bars < 2 or not np.isfinite(positions).all() or np.all(positions == positions[0]):
+        return {"status": "not_meaningful", "note": "degenerate positions — null test not meaningful"}
     per_side = (spec["costs"].get("commission_bps", 0) + spec["costs"].get("slippage_bps", 0)) / 1e4
-
-    # All trials at once: a (n, n_bars) 0/1 position matrix. argsort of a random
-    # matrix gives k distinct bar indices per row, matching rng.choice(replace=False).
-    pos = np.zeros((n, n_bars))
-    chosen = np.argsort(rng.random((n, n_bars)), axis=1)[:, :k]
-    np.put_along_axis(pos, chosen, 1.0, axis=1)
-
-    net = pos * ret - np.abs(np.diff(pos, axis=1, prepend=0.0)) * per_side
+    order = np.argsort(rng.random((n, n_bars)), axis=1)
+    pos = positions[order]
+    gross = (pos * returns[None, :, :]).sum(axis=2)
+    turnover = np.abs(np.diff(pos, axis=1, prepend=np.zeros((n, 1, pos.shape[2])))).sum(axis=2)
+    borrow = np.maximum(-pos, 0).sum(axis=2) * spec["costs"].get("borrow_bps_annual", 0) / 1e4 / TRADING_DAYS
+    leverage = np.maximum(np.abs(pos).sum(axis=2) - 1, 0)
+    financing = leverage * spec["costs"].get("financing_bps_annual", 0) / 1e4 / TRADING_DAYS
+    net = gross - turnover * per_side - borrow - financing
     std = net.std(axis=1)
     sharpes = np.where(std > 0, net.mean(axis=1) / np.where(std > 0, std, 1.0) * np.sqrt(TRADING_DAYS), 0.0)
 
-    actual = metrics(res)["sharpe"]
+    actual_returns = res["net"].to_numpy(float)
+    actual_std = actual_returns.std()
+    if actual_std == 0:
+        return {"status": "not_meaningful", "note": "constant returns — null test not meaningful"}
+    actual = actual_returns.mean() / actual_std * np.sqrt(TRADING_DAYS)
     return {
         "actual_sharpe": actual,
         "null_sharpe_mean": round(float(sharpes.mean()), 3),
