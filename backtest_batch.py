@@ -29,8 +29,11 @@ FAILED = ROOT / "results" / "failed.jsonl"
 DEFAULT_TIMEOUT = 600
 
 
-def _backtest_cmd(spec: Path) -> list[str]:
-    return ["uv", "run", "python", "backtest.py", str(spec)]
+def _backtest_cmd(spec: Path, n_trials: int | None = None) -> list[str]:
+    command = ["uv", "run", "python", "backtest.py", str(spec)]
+    if n_trials is not None:
+        command += ["--n-trials", str(n_trials)]
+    return command
 
 
 def _kill_group(pid: int) -> None:
@@ -43,7 +46,7 @@ def _kill_group(pid: int) -> None:
         pass  # already gone, or re-parented before we got to it
 
 
-def run_one(spec: Path, timeout: int) -> dict:
+def run_one(spec: Path, timeout: int, n_trials: int | None = None) -> dict:
     """One spec in an isolated process. Expected failures (timeout, nonzero
     exit, missing interpreter) come back as {"spec", "error"} dicts.
 
@@ -52,7 +55,7 @@ def run_one(spec: Path, timeout: int) -> dict:
     wrapper itself.
     """
     try:
-        proc = subprocess.Popen(_backtest_cmd(spec), stdout=subprocess.PIPE,
+        proc = subprocess.Popen(_backtest_cmd(spec, n_trials), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True,
                                 cwd=ROOT, start_new_session=True)
     except OSError as exc:
@@ -104,6 +107,7 @@ def main_with(argv: list[str] | None = None) -> int:
     done = already_run(LEADERBOARD)
     ok = failed = 0
     specs = []
+    scheduled_slugs: set[str] = set()
     for path in sorted(args.specs.glob("*.yaml")):
         try:
             slug = yaml.safe_load(path.read_text())["meta"]["slug"]
@@ -114,6 +118,7 @@ def main_with(argv: list[str] | None = None) -> int:
             continue
         if slug not in done:
             specs.append(path)
+            scheduled_slugs.add(slug)
     if not specs:
         if failed:
             print(f"\n{ok} ok, {failed} failed (see {FAILED.relative_to(ROOT)})")
@@ -121,11 +126,12 @@ def main_with(argv: list[str] | None = None) -> int:
             print(f"nothing to backtest in {args.specs} -- all specs have leaderboard rows")
         return 0
 
+    trial_snapshot = len(done | scheduled_slugs)
     print(f"backtesting {len(specs)} specs "
           f"({args.jobs} at a time, {args.timeout}s cap each)\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(run_one, s, args.timeout): s for s in specs}
+        futures = {pool.submit(run_one, s, args.timeout, trial_snapshot): s for s in specs}
         for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
             result = fut.result()
             if "error" in result:

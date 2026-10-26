@@ -271,6 +271,15 @@ class TestDeflatedSharpe:
         long = backtest.deflated_sharpe(1.5, 2520, 10)
         assert long > short
 
+    def test_default_trial_count_uses_unique_completed_slugs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(backtest, "ROOT", tmp_path)
+        path = tmp_path / "results" / "leaderboard.jsonl"
+        path.parent.mkdir()
+        path.write_text('{"slug": "one"}\n{"slug": "one"}\n{"slug": "two"}\n')
+
+        assert backtest.effective_trial_count("three", None) == 3
+        assert backtest.effective_trial_count("two", None) == 2
+
 
 class TestRandomEntryNull:
     def test_degenerate_all_cash_returns_note(self):
@@ -402,6 +411,7 @@ class TestWriteReport:
             "param_sweep": {"lookback": {"100": 0.9, "200": 1.0}},
             "null_test": backtest.random_entry_null(res, BASE_SPEC, n=20),
             "deflated_sharpe": 0.9,
+            "n_trials": 3,
             "auto_flags": ["WEAK: does not beat buy-and-hold after costs"],
         }
         return tmp_path, spec, out
@@ -583,6 +593,7 @@ class TestAppendLeaderboard:
             "full": backtest.metrics(res),
             "null_test": {"beats_null_95": True},
             "deflated_sharpe": 0.9,
+            "n_trials": 3,
             "auto_flags": ["WEAK: does not beat buy-and-hold after costs"],
         }
         return spec, out
@@ -596,6 +607,7 @@ class TestAppendLeaderboard:
         assert rows["verdict"] == "WEAKER"
         assert rows["net_sharpe"] == out["full"]["sharpe"]
         assert rows["deflated_sharpe"] == 0.9
+        assert rows["n_trials"] == 3
         assert rows["beats_null_95"] is True
         assert rows["flags"] == out["auto_flags"]
         assert "run_at" in rows

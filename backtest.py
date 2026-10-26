@@ -278,6 +278,25 @@ def deflated_sharpe(sharpe: float, n_bars: int, n_trials: int) -> float:
     return round(float(sharpe - e_max / sqrt(n_bars / TRADING_DAYS)), 3)
 
 
+def effective_trial_count(slug: str, n_trials: int | None) -> int:
+    """Use an explicit batch snapshot or unique completed strategy slugs."""
+    if n_trials is not None:
+        if n_trials < 1:
+            raise ValueError("n_trials must be at least 1")
+        return n_trials
+    path = ROOT / "results" / "leaderboard.jsonl"
+    completed: set[str] = set()
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and isinstance(row.get("slug"), str):
+                completed.add(row["slug"])
+    return len(completed | {slug})
+
+
 # ---------------------------------------------------------------- orchestration
 
 def load_strategy(slug: str):
@@ -300,6 +319,7 @@ def run_spec(spec: dict, n_trials: int | None) -> dict:
     if spec.get("data", {}).get("bar") != "1d":
         sys.exit("only daily bars are supported; set data.bar: 1d")
     slug = spec["meta"]["slug"]
+    trial_count = effective_trial_count(slug, n_trials)
     mod = load_strategy(slug)
 
     tickers = spec["data"]["universe"]
@@ -379,10 +399,9 @@ def run_spec(spec: dict, n_trials: int | None) -> dict:
         }
 
     out["null_test"] = random_entry_null(res, spec)
+    out["n_trials"] = trial_count
     out["deflated_sharpe"] = deflated_sharpe(
-        out["full"]["sharpe"], out["full"]["n_bars"],
-        n_trials or spec["validation"]["multiple_testing"].get("n_tested_so_far") or 1,
-    )
+        out["full"]["sharpe"], out["full"]["n_bars"], trial_count)
     out["auto_flags"] = auto_flags(spec, out)
     out["auto_flags"] += catalog.frequency_flags(tickers, spec["data"].get("bar"))
     out["auto_flags"] += catalog.provenance_flags(tickers)
@@ -438,7 +457,7 @@ def write_report(spec_path: Path, out: dict) -> Path:
         "",
         f"Gross Sharpe {out['gross']['sharpe']} vs net {m['sharpe']}; "
         f"annual cost drag {m['cost_drag_annual']:.2%}. "
-        f"Deflated Sharpe {out['deflated_sharpe']}.",
+        f"Deflated Sharpe {out['deflated_sharpe']} across {out['n_trials']} tested strategies.",
         "",
         "## In-sample vs since-publication",
         "",
@@ -517,6 +536,7 @@ def append_leaderboard(spec: dict, out: dict, path: Path | None = None) -> Path:
         "verdict": (spec.get("verdict") or {}).get("status") or "unknown",
         "net_sharpe": out["full"]["sharpe"],
         "deflated_sharpe": out["deflated_sharpe"],
+        "n_trials": out["n_trials"],
         "beats_null_95": out["null_test"].get("beats_null_95"),
         "commit": commit,
         "run_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
