@@ -80,6 +80,22 @@ def load_panel(tickers: list[str], start, end, cache_dir: Path):
 
 # ---------------------------------------------------------------- backtest
 
+def validate_next_open_inputs(data: dict[str, pd.DataFrame]) -> None:
+    """Reject calendars where an open-to-open return cannot be observed."""
+    if not data:
+        raise ValueError("next_open requires at least one price series")
+    indexes = [frame.index for frame in data.values()]
+    if any(not index.equals(indexes[0]) for index in indexes[1:]):
+        raise ValueError("next_open requires identical trading calendars")
+    for ticker, frame in data.items():
+        if "open" not in frame:
+            raise ValueError(f"{ticker} has no open column")
+        opens = pd.to_numeric(frame["open"], errors="coerce")
+        invalid = ~np.isfinite(opens) | (opens <= 0)
+        if invalid.any():
+            date = frame.index[invalid.to_numpy()][0].date()
+            raise ValueError(f"{ticker} has an invalid open on {date}")
+
 def backtest(df: pd.DataFrame, weights: pd.Series, spec: dict) -> pd.DataFrame:
     """Weights are as-of-decision; the harness applies the lag and the costs."""
     rules, costs = spec["rules"], spec["costs"]
@@ -97,6 +113,7 @@ def backtest(df: pd.DataFrame, weights: pd.Series, spec: dict) -> pd.DataFrame:
     # the open t-1 -> close t-1 move that PRECEDED its own signal. That is lookahead,
     # and it inflates Sharpe by roughly 2x on a daily trend overlay.
     if rules.get("execution_price") == "next_open":
+        validate_next_open_inputs({"asset": df})
         asset_ret = (df["open"].shift(-1) / df["open"] - 1).fillna(0.0)
     else:
         asset_ret = df["close"].pct_change().fillna(0.0)
@@ -144,6 +161,7 @@ def backtest_multi(data: dict[str, pd.DataFrame], weights: pd.DataFrame,
     pos_frame = w.shift(lag).fillna(0.0)
 
     if rules.get("execution_price") == "next_open":
+        validate_next_open_inputs(data)
         rets = pd.DataFrame({t: (df["open"].shift(-1) / df["open"] - 1).fillna(0.0)
                              for t, df in data.items()})
     else:
@@ -281,6 +299,11 @@ def run_spec(spec: dict, n_trials: int | None) -> dict:
             if missing:
                 sys.exit(f"{', '.join(missing)} has no open column (close-only series) "
                          f"— set execution_price: close in the spec's rules")
+            try:
+                validate_next_open_inputs(
+                    {tickers[0]: df} if len(tickers) == 1 else data)
+            except ValueError as exc:
+                sys.exit(str(exc))
         return df if len(tickers) == 1 else data
 
     def evaluate(spec_variant: dict, params_override: dict) -> pd.DataFrame:

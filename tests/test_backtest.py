@@ -59,6 +59,13 @@ class TestBacktest:
         expected = (df["open"].shift(-1) / df["open"] - 1).fillna(0.0)
         assert np.allclose(res["asset_ret"], expected)
 
+    def test_next_open_rejects_missing_open_bar(self):
+        df = make_prices()
+        df = df.assign(open=df["open"].where(np.arange(len(df)) != 10))
+        spec = dict(BASE_SPEC, rules={"execution_price": "next_open"})
+        with pytest.raises(ValueError, match="invalid open"):
+            backtest.backtest(df, pd.Series(1.0, index=df.index), spec)
+
     def test_costs_reduce_gross_by_turnover_times_bps(self):
         df = make_prices()
         spec = {"signal": {}, "rules": {}, "costs": {"slippage_bps": 100}}
@@ -151,6 +158,14 @@ class TestBacktestMulti:
                              for t, d in data.items()})
         pos = (w * 0.5).shift(1).fillna(0.0)
         assert np.allclose(res["gross"], (pos * rets).sum(axis=1))
+
+    def test_next_open_rejects_mismatched_calendars(self):
+        data = make_panel()
+        data["BBB"] = data["BBB"].drop(data["BBB"].index[0])
+        spec = {**MULTI_SPEC, "rules": {"execution_price": "next_open", "max_leverage": 1.0}}
+        weights = pd.DataFrame(1.0, index=data["AAA"].index, columns=["AAA", "BBB"])
+        with pytest.raises(ValueError, match="identical trading calendars"):
+            backtest.backtest_multi(data, weights, spec)
 
     def test_missing_weight_columns_filled_zero(self):
         data = make_panel()
