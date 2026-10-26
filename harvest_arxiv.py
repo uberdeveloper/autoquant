@@ -165,11 +165,13 @@ def main_with(argv: list[str] | None = None) -> int:
                    f"&sortBy=submittedDate&sortOrder=descending"
                    f"&start={start}&max_results={want}")
             try:
-                rows = parse_atom(get(session, url))
+                response_text = get(session, url)
+                raw_entries = len(ET.fromstring(response_text).findall(ATOM + "entry"))
+                rows = parse_atom(response_text)
             except Exception as exc:
                 print(f"api start={start}: {exc}", file=sys.stderr)
                 break
-            if not rows:
+            if raw_entries == 0:
                 break  # exhausted
             added = 0
             for row in rows:
@@ -183,9 +185,11 @@ def main_with(argv: list[str] | None = None) -> int:
                 added += 1
                 new += 1
             print(f"start={start}: {len(rows)} entries, {added} new")
-            if added == 0:
-                break  # everything on this page is already known -> done
-            start += PAGE_SIZE
+            # A known page does not mean later pages are known. Continue until
+            # the API returns a short page or no entries.
+            if raw_entries < want:
+                break
+            start += want
             time.sleep(args.sleep)
 
     print(f"\n{new} new articles -> {args.out}")
