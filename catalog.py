@@ -19,6 +19,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from pandas_datareader.fred import FredReader
 
@@ -208,6 +209,23 @@ def _write_cache(cache: Path, df: pd.DataFrame) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _read_cache(cache: Path) -> pd.DataFrame | None:
+    """Malformed data is a cache miss; filesystem access errors stay visible."""
+    try:
+        df = pd.read_csv(cache, index_col=0, parse_dates=True)
+        if (df.empty or "close" not in df or
+                not isinstance(df.index, pd.DatetimeIndex) or
+                df.index.hasnans or df.index.has_duplicates):
+            return None
+        df["close"] = pd.to_numeric(df["close"], errors="raise")
+        if not np.isfinite(df["close"].to_numpy()).all():
+            return None
+        return df.sort_index()
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, ValueError,
+            UnicodeError, FileNotFoundError):
+        return None
+
+
 def _entry_for(series_id: str) -> dict:
     """Seeded entry, or a synthetic one for unseeded yahoo: ids -- they
     fetch exactly like bare tickers always have. fred:/stooq: ids must be
@@ -237,12 +255,8 @@ def load(series_id: str, start, end) -> pd.DataFrame:
 
     df = None
     if cache.exists():
-        df = pd.read_csv(cache, index_col=0, parse_dates=True)
-        if df.empty or "close" not in df.columns:
-            cache.unlink()          # truncated/interrupted write -- refetch
-            df = None
-        else:
-            df = df.sort_index()    # self-heal a poisoned (unsorted) cache
+        df = _read_cache(cache)
+        if df is not None:
             PROVENANCE[entry["id"]] = "cache"
     if df is None:
         try:

@@ -46,9 +46,8 @@ def load_prices(ticker: str, start, end, cache_dir: Path) -> pd.DataFrame:
             sys.exit(f"error: {exc}")
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache = cache_dir / f"{ticker.replace('/', '_')}.csv"
-    if cache.exists():
-        df = pd.read_csv(cache, index_col=0, parse_dates=True)
-    else:
+    df = catalog._read_cache(cache) if cache.exists() else None
+    if df is None:
         import yfinance as yf
 
         df = yf.download(ticker, start="1990-01-01", auto_adjust=True, progress=False)

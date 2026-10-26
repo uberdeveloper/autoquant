@@ -433,3 +433,20 @@ def test_concurrent_cache_writers_publish_complete_files(tmp_path, monkeypatch):
     values = pd.read_csv(path)['close']
     assert values.eq(10.0).all() or values.eq(20.0).all()
     assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize('contents', ['', 'garbage', ',close\nnot-a-date,100\n',
+                                       ',close\n2024-01-02,nope\n',
+                                       ',open\n2024-01-02,100\n',
+                                       ',close\n2024-01-02,inf\n'])
+def test_corrupt_cache_is_refetched(tmp_path, monkeypatch, contents):
+    monkeypatch.setattr(catalog, 'CACHE_DIR', tmp_path)
+    path = catalog.cache_path('fred:DGS10')
+    path.write_text(contents)
+    expected = pd.DataFrame({'close': [4.0]}, index=pd.to_datetime(['2024-01-02']))
+    calls = []
+    monkeypatch.setitem(catalog.PROVIDERS, 'fred', lambda symbol: calls.append(symbol) or expected)
+    actual = catalog.load('fred:DGS10', None, None)
+    pd.testing.assert_frame_equal(actual, expected)
+    assert calls == ['DGS10']
+    assert pd.read_csv(path)['close'].tolist() == [4.0]
