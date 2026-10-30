@@ -1,0 +1,37 @@
+version: 1
+
+families:
+  equity_large_cap:
+    description: "Global large-cap benchmark equities / ETFs"
+    benchmark: "yahoo:SPY"
+    peers:
+      - id: "yahoo:SPY"
+        label: "S&P 500 (US Large)"
+      - id: "yahoo:^NSEI"
+        label: "Nifty 50 (India Large)"
+      - id: "yahoo:^STOXX50E"
+        label: "Euro Stoxx 50 (Europe Large)"
+      - id: "yahoo:^N225"
+        label: "Nikkei 225 (Japan Large)"
+      - id: "yahoo:^RUA"
+        label: "Russell 3000 (US Broad)"
+
+  equity_tech:
+    description: "Technology & High-growth equities"
+    benchmark: "yahoo:QQQ"
+    peers:
+      - id: "yahoo:QQQ"
+        label: "Nasdaq 100"
+      - id: "yahoo:SMH"
+        label: "Semiconductors ETF"
+
+  fixed_income_us:
+    description: "US Sovereign & Corporate debt"
+    benchmark: "fred:DGS10"
+    peers:
+      - id: "fred:DGS10"
+        label: "10-Year Treasury Yield"
+      - id: "fred:DGS2"
+        label: "2-Year Treasury Yield"
+      - id: "yahoo:TLT"
+        label: "20+ Year Treasury Bond ETF"

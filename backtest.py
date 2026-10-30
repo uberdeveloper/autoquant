@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import catalog
+import market_families
+import runs_db
 import numpy as np
 import pandas as pd
 import yaml
@@ -483,25 +485,152 @@ def append_leaderboard(spec: dict, out: dict, path: Path | None = None) -> Path:
     return path
 
 
-def main() -> int:
+def record_to_runs_db(spec: dict, out: dict, run_type: str, data_source: str,
+                       change_description: str | None = None,
+                       universe_family: str | None = None,
+                       db_path: Path | str | None = None,
+                       report_path: Path | str | None = None) -> None:
+    """Record this backtest execution in the DuckDB runs table."""
+    conn = runs_db.get_connection(db_path)
+    clean_src = data_source.replace(":", "_").replace("/", "_").replace("^", "")
+    run_id = f"{out['slug']}--{clean_src}--{out.get('run_at_hash', datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S'))}"
+    
+    full_m = out.get("full", {})
+    oos_m = out.get("out_of_sample", {})
+    is_m = out.get("in_sample", {})
+    bh_m = out.get("benchmark_bh", {})
+    
+    record = {
+        "run_id": run_id,
+        "strategy_slug": out["slug"],
+        "run_type": run_type,
+        "change_description": change_description,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "data_source": data_source,
+        "universe_family": universe_family,
+        "bar_frequency": spec.get("data", {}).get("bar", "1d"),
+        "start_date": str(spec.get("data", {}).get("start")),
+        "end_date": str(spec.get("data", {}).get("end")),
+        "params_json": {k: v for k, v in spec.get("signal", {}).items() if k not in ("definition", "lag_bars")},
+        "rules_json": spec.get("rules", {}),
+        "costs_json": spec.get("costs", {}),
+        "cagr": full_m.get("cagr"),
+        "net_sharpe": full_m.get("sharpe"),
+        "gross_sharpe": out.get("gross", {}).get("sharpe"),
+        "max_drawdown": full_m.get("max_drawdown"),
+        "turnover_annual": full_m.get("trades"), # trades proxy
+        "win_rate": full_m.get("win_rate"),
+        "is_sharpe": is_m.get("sharpe"),
+        "oos_sharpe": oos_m.get("sharpe"),
+        "beats_oos": (oos_m.get("sharpe") is not None and oos_m.get("sharpe") > 0),
+        "beats_null": out.get("null_test", {}).get("beats_null_95"),
+        "benchmark_cagr": bh_m.get("cagr"),
+        "benchmark_sharpe": bh_m.get("sharpe"),
+        "verdict": (spec.get("verdict") or {}).get("status") or "unknown",
+        "raw_metrics_json": out,
+        "report_path": str(report_path) if report_path else None,
+    }
+    runs_db.record_run(conn, record)
+    conn.close()
+
+
+def run_cli(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("spec", type=Path)
     ap.add_argument("--n-trials", type=int, default=None,
                     help="ideas tested so far, for the multiple-testing haircut")
     ap.add_argument("--json", action="store_true")
-    args = ap.parse_args()
+    ap.add_argument("--replace-data", type=str, default=None,
+                    help="replace universe with a single alternative data source")
+    ap.add_argument("--cross-test-peers", action="store_true",
+                    help="run strategy across its peer market family")
+    ap.add_argument("--families-file", type=Path, default=None,
+                    help="path to market families rulebook YAML")
+    ap.add_argument("--family", type=str, default=None,
+                    help="specific family to test against")
+    ap.add_argument("--description", type=str, default=None,
+                    help="custom description of change or hypothesis")
+    ap.add_argument("--db-path", type=Path, default=None,
+                    help="custom path to runs.duckdb")
+    args = ap.parse_args(argv)
 
+    spec_dict = yaml.safe_load(args.spec.read_text())
+    base_universe = spec_dict.get("data", {}).get("universe", [])
+    primary_ticker = base_universe[0] if base_universe else "unknown"
+
+    # Resolve family
+    family_name = args.family or spec_dict.get("data", {}).get("family") or market_families.find_family_for_ticker(primary_ticker, args.families_file)
+
+    if args.cross_test_peers:
+        peers = []
+        if family_name:
+            fams = market_families.load_families(args.families_file)
+            peers = fams.get(family_name, {}).get("peers", [])
+        if not peers:
+            peers = market_families.get_peers_for_ticker(primary_ticker, args.families_file)
+        if not peers:
+            sys.exit(f"error: no peer family found for {primary_ticker}")
+
+        print(f"=== Cross-Testing Peers for {spec_dict['meta']['slug']} (Family: {family_name}) ===")
+        print(f"{'Source':<20} {'Label':<25} {'Sharpe':<10} {'CAGR':<10} {'MaxDD':<10}")
+        print("-" * 75)
+
+        for peer in peers:
+            peer_id = peer.get("id") if isinstance(peer, dict) else str(peer)
+            peer_label = peer.get("label", peer_id) if isinstance(peer, dict) else peer_id
+            
+            variant_spec = copy.deepcopy(spec_dict)
+            variant_spec["data"]["universe"] = [peer_id]
+            
+            run_type = "original" if peer_id in base_universe or primary_ticker in peer_id else "peer_cross"
+            desc = args.description or f"Peer family '{family_name}': {peer_label}"
+
+            out = run_spec(variant_spec, args.n_trials)
+            record_to_runs_db(variant_spec, out, run_type=run_type, data_source=peer_id,
+                              change_description=desc, universe_family=family_name,
+                              db_path=args.db_path)
+
+            sh = f"{out['full'].get('sharpe', 0.0):.2f}"
+            cg = f"{out['full'].get('cagr', 0.0)*100:.1f}%" if out['full'].get('cagr') is not None else "N/A"
+            dd = f"{out['full'].get('max_drawdown', 0.0)*100:.1f}%" if out['full'].get('max_drawdown') is not None else "N/A"
+            print(f"{peer_id:<20} {peer_label:<25} {sh:<10} {cg:<10} {dd:<10}")
+
+        return 0
+
+    if args.replace_data:
+        variant_spec = copy.deepcopy(spec_dict)
+        variant_spec["data"]["universe"] = [args.replace_data]
+        desc = args.description or f"Replaced data {primary_ticker} -> {args.replace_data}"
+        out = run_spec(variant_spec, args.n_trials)
+        if args.json:
+            print(json.dumps(out, indent=2, default=str))
+        
+        record_to_runs_db(variant_spec, out, run_type="replacement", data_source=args.replace_data,
+                          change_description=desc, universe_family=family_name, db_path=args.db_path)
+        print(f"\n{out['slug']} [{args.replace_data}]: Sharpe {out['full']['sharpe']} net "
+              f"(B&H {out['benchmark_bh']['sharpe']}), {out['full']['trades']} trades")
+        return 0
+
+    # Default Baseline Run
     out = run(args.spec, args.n_trials)
     if args.json:
         print(json.dumps(out, indent=2, default=str))
     report = write_report(args.spec, out)
-    append_leaderboard(yaml.safe_load(args.spec.read_text()), out)
+    append_leaderboard(spec_dict, out)
+    record_to_runs_db(spec_dict, out, run_type="original", data_source=primary_ticker,
+                      change_description=args.description or "Baseline run",
+                      universe_family=family_name, db_path=args.db_path, report_path=report)
+
     print(f"\n{out['slug']}: Sharpe {out['full']['sharpe']} net "
           f"(B&H {out['benchmark_bh']['sharpe']}), {out['full']['trades']} trades")
     for f in out["auto_flags"]:
         print(f"  {f}")
     print(f"-> {report}")
     return 0
+
+
+def main() -> int:
+    return run_cli(sys.argv[1:])
 
 
 if __name__ == "__main__":
