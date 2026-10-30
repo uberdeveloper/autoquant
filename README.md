@@ -27,6 +27,8 @@ python3 extract.py                # [4] triaged article -> specs/<slug>.yaml
 python3 codegen.py                # [5] spec -> strategies/<slug>.py (smoke-tested)
 python3 backtest_batch.py         # [6-8] every spec, isolated process, timeout-capped
 uv run python backtest.py specs/<slug>.yaml   # [6-8] single spec + report + leaderboard row
+uv run python backtest.py specs/<slug>.yaml --replace-data yahoo:^NSEI   # test on alternative source
+uv run python backtest.py specs/<slug>.yaml --cross-test-peers           # test across peer family in market_families.yaml
 python3 catalog.py search rates   # find data series across providers (yahoo/fred/stooq)
 ```
 
