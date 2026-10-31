@@ -9,6 +9,15 @@ import llm
 import triage
 
 
+def valid_result(**overrides):
+    result = {"score": 4, "asset_class": "equity_index", "data_needed": "daily OHLCV",
+              "data_available": True, "est_effort": 2, "claim": "A testable claim.",
+              "evidence": ["stated rule"], "missing": [], "red_flags": [],
+              "reason": "The rule is sufficiently specified."}
+    result.update(overrides)
+    return result
+
+
 ROW = {
     "title": "Volatility Premium",
     "source": "Blog",
@@ -65,15 +74,34 @@ class TestParseJson:
         with pytest.raises(ValueError, match="no JSON object"):
             triage.parse_json("there is nothing here")
 
+    def test_array_reply_is_rejected(self):
+        with pytest.raises(ValueError, match="object"):
+            triage.parse_json('[{"score": 4}]')
+
+
+class TestValidation:
+    def test_rejects_truthy_boolean_for_score(self):
+        with pytest.raises(ValueError, match="score"):
+            triage.validate(valid_result(score=True))
+
+    def test_rejects_unknown_red_flag(self):
+        with pytest.raises(ValueError, match="red_flags"):
+            triage.validate(valid_result(red_flags=["made_up"]))
+
 
 class TestScoreOne:
+    def test_missing_page_becomes_error_row(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(triage, "ROOT", tmp_path)
+        result = triage.score_one(dict(ROW, page="missing.md"), "RUBRIC", None)
+        assert result["error"].startswith("unreadable article:")
+
     def test_cli_success_attaches_article_fields(self, tmp_path, monkeypatch):
         row = dict(ROW, page="data/pages/x.md", slug="volatility-premium")
         page = tmp_path / "data" / "pages" / "x.md"
         page.parent.mkdir(parents=True)
         page.write_text("---\n\nbody\n")
 
-        reply = json.dumps({"score": 4, "asset_class": "equity"})
+        reply = json.dumps(valid_result())
         recorded = {}
 
         def fake_run(cmd, input, capture_output, text, timeout):
@@ -134,7 +162,7 @@ class TestScoreOne:
             seen["model"] = model
             seen["extra"] = list(extra or [])
             seen["timeout"] = timeout
-            return json.dumps({"score": 4})
+            return json.dumps(valid_result())
 
         monkeypatch.setattr(triage.llm, "complete", fake_complete)
         triage.score_one(row, "RUBRIC", "sonnet", ["--output-format", "json"])
@@ -172,6 +200,8 @@ class TestMainCircuitBreaker:
         monkeypatch.setattr(triage, "TRIAGE", triage_path)
         monkeypatch.setattr(triage, "PROMPT", tmp_path / "prompt.md")
         (tmp_path / "prompt.md").write_text("RUBRIC")
+
+        monkeypatch.setattr(triage.llm, "preflight", lambda: None)
 
         def fake_complete(prompt, **k):
             raise llm.LLMError("opencode exited 1: auth expired")

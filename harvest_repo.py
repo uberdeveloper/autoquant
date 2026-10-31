@@ -1,33 +1,43 @@
-#!/usr/bin/env python3
-"""Stage [E1] REPO HARVEST — shallow-clone strategy repos + inventory manifest.
+"""Harvest (shallow-clone) strategy repos and write an inventory manifest.
 
-    python3 harvest_repo.py LastAncientOne/Stock_Analysis_For_Quant
-    python3 harvest_repo.py --repos-file pilot_repos.txt
+CLI usage:
+    python3 harvest_repo.py owner/repo [owner/repo ...]
+    python3 harvest_repo.py --repos repos.txt
 
-Clones https://github.com/<owner>/<repo> --depth 1 into
-data/repos/<owner>-<repo>/ and writes data/repos/<owner>-<repo>/manifest.json:
-
+Manifest schema (data/repos/<owner>-<name>/manifest.json):
     {
-      "repo": "owner/name",
-      "sha": "<40-hex pinned commit>",
-      "cloned_at": "<iso8601>",
-      "notebooks":  [{"path", "kernel", "has_outputs", "n_cells", "unparsable"?}],
-      "scripts":    [{"path", "has_main", "n_lines"}],
-      "spec_texts": [{"path"}],            # md/yaml mentioning strategy terms
-      "data_files": [{"path", "bytes"}],   # csv/parquet/h5/pkl/feather
-      "deps": {"requirements_txt"|"environment_yml"|"setup_py"|"pyproject_toml":
-               "relpath"|null}
+      "repo":   {"owner":..., "name":..., "url":..., "sha":..., "cloned_at":...},
+      "notebooks": [{"path":..., "kernel":..., "cells":..., "has_outputs":...}],
+      "scripts":   [{"path":..., "has_main":...}],
+      "specs":     [{"path":...}],
+      "data":      [{"path":..., "bytes":...}],
+      "deps":      {"requirements_txt":..., "environment_yml":..., "setup_py":...},
+      "counts":    {"notebooks":..., "scripts":..., "specs":..., "data":...}
     }
 
-Resumable: a repo whose manifest records the remote HEAD sha is skipped; a
-changed sha triggers a fresh shallow clone. data/repos/ is covered by the
-data/ gitignore rule.
+Classification rules (deterministic):
+- notebooks: *.ipynb; kernel from metadata.kernelspec.name (default "unknown");
+  cells = cell count; has_outputs = any cell with non-empty outputs or non-null
+  execution_count.
+- scripts: *.py; has_main = file contains an `if __name__` guard.
+- specs: *.yaml/*.yml (any), plus *.md whose lowercase filename or content
+  contains strateg, signal, or backtest.
+- data: extensions csv parquet h5 hdf5 pickle pkl xlsx, with byte size.
+- deps: presence of requirements.txt, environment.yml, setup.py at repo root.
+- Skip .git/, hidden dirs, __pycache__, .venv.
+
+Resume: a repo is skipped only when the manifest inside its directory records
+the same owner/name AND the local clone's HEAD still equals the recorded SHA.
+A fresh clone happens when the directory is missing, when the directory holds
+a different repo (owner/name mismatch), or when the existing clone is broken.
+No fetch is performed: picking up upstream commits requires deleting the
+clone. data/ is already gitignored.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import re
+import os
 import shutil
 import subprocess
 import sys
@@ -35,181 +45,238 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-REPOS = ROOT / "data" / "repos"
 
-DATA_EXTS = {".csv", ".parquet", ".h5", ".hdf5", ".pkl", ".pickle", ".feather"}
-SPEC_TEXT_EXTS = {".md", ".yaml", ".yml"}
-SPEC_TEXT_KEYWORDS = ("entry", "signal", "position", "backtest", "allocation",
-                      "stop", "rebalance", "strategy")
-DEP_KEYS = {"requirements.txt": "requirements_txt", "environment.yml": "environment_yml",
-            "setup.py": "setup_py", "pyproject.toml": "pyproject_toml"}
-SKIP_DIRS = {".git", ".ipynb_checkpoints", "__pycache__", ".venv", "venv",
-             "node_modules"}
-SLUG_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+DATA_EXTS = {"csv", "parquet", "h5", "hdf5", "pickle", "pkl", "xlsx"}
+SKIP_DIRS = {".git", "__pycache__", ".venv"}
 
 
-def repo_slug(owner_repo: str) -> str:
-    """'owner/name' -> 'owner-name' (directory name under data/repos/)."""
-    return owner_repo.strip("/").replace("/", "-")
+def parse_repo_spec(spec: str) -> tuple[str, str]:
+    if not isinstance(spec, str) or not spec:
+        raise ValueError("bad spec")
+    if "/" not in spec:
+        raise ValueError("bad spec")
+    parts = spec.split("/")
+    if len(parts) != 2:
+        raise ValueError("bad spec")
+    owner, name = parts
+    if not owner or not name:
+        raise ValueError("bad spec")
+    if owner.startswith(".") or name.startswith("."):
+        raise ValueError("bad spec")
+    if ".." in (owner, name) or owner.startswith("/") or name.startswith("/"):
+        raise ValueError("bad spec")
+    return owner, name
 
 
-def remote_sha(owner_repo: str) -> str | None:
-    """Remote HEAD sha without cloning; None if the repo is unreachable."""
-    proc = subprocess.run(
-        ["git", "ls-remote", f"https://github.com/{owner_repo}", "HEAD"],
-        capture_output=True, text=True, timeout=120)
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return None
-    return proc.stdout.split()[0]
+def repos_from_file(path: Path) -> list[str]:
+    out: list[str] = []
+    for line in Path(path).read_text().splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    return out
 
 
-def clone(owner_repo: str, dest: Path) -> None:
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(
-        ["git", "clone", "--depth", "1",
-         f"https://github.com/{owner_repo}.git", str(dest)],
-        capture_output=True, text=True, timeout=1800)
-    if proc.returncode != 0:
-        raise RuntimeError(f"clone failed: {proc.stderr.strip()[:200]}")
+def repo_url(owner: str, name: str) -> str:
+    return f"https://github.com/{owner}/{name}.git"
 
 
-def _is_spec_text(path: Path) -> bool:
+def repo_dir(owner: str, name: str, root: Path) -> Path:
+    return Path(root) / "data" / "repos" / f"{owner}-{name}"
+
+
+def run_git(argv: list[str]) -> str:
+    """Run a git command, returning stripped stdout; raise RuntimeError on failure.
+
+    Uses a 600-second timeout so a hung connection cannot block a batch run,
+    and GIT_TERMINAL_PROMPT=0 so git never waits for credentials.
+    """
     try:
-        with path.open(errors="ignore") as fh:
-            head = fh.read(4000).lower()
+        r = subprocess.run(argv, capture_output=True, text=True, check=True,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                           timeout=600)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(e.stderr) from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"git timed out after 600s: {' '.join(argv)}") from e
+    return (r.stdout or "").strip()
+
+
+def clone_repo(owner: str, name: str, dest) -> None:
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    run_git(["git", "clone", "--depth", "1", repo_url(owner, name), str(dest)])
+
+
+def rev_parse(dest: Path) -> str:
+    return run_git(["git", "-C", str(dest), "rev-parse", "HEAD"])
+
+
+def _has_main(path: Path) -> bool:
+    try:
+        text = path.read_text(errors="replace")
     except OSError:
         return False
-    return any(k in head for k in SPEC_TEXT_KEYWORDS)
+    return "if __name__" in text
 
 
-def _scan_notebook(rel: str, path: Path) -> dict:
-    row: dict = {"path": rel, "kernel": None, "has_outputs": False, "n_cells": 0}
-    try:
-        nb = json.loads(path.read_text(errors="ignore"))
-    except (json.JSONDecodeError, OSError):
-        row["unparsable"] = True
-        return row
-    cells = nb.get("cells", [])
-    row["n_cells"] = len(cells)
-    row["kernel"] = (nb.get("metadata", {}).get("kernelspec", {}) or {}).get("name")
-    row["has_outputs"] = any(c.get("outputs") for c in cells)
-    return row
-
-
-def scan(repo_dir: Path) -> dict:
-    """Inventory the cloned tree into manifest sections (schema: docstring)."""
-    notebooks, scripts, spec_texts, data_files = [], [], [], []
-    deps = {key: None for key in DEP_KEYS.values()}
-    for path in sorted(repo_dir.rglob("*")):
-        rel = str(path.relative_to(repo_dir))
-        if path.is_dir():
+def inventory(tree: Path) -> dict:
+    tree = Path(tree)
+    notebooks: list[dict] = []
+    scripts: list[dict] = []
+    specs: list[dict] = []
+    data: list[dict] = []
+    for p in sorted(tree.rglob("*")):
+        if not p.is_file():
             continue
-        if set(path.parts) & SKIP_DIRS:
+        rel = p.relative_to(tree)
+        # skip hidden/SKIP_DIRS directories at any depth (all but the last
+        # component is a directory), plus hidden files at any depth
+        if any(part in SKIP_DIRS or part.startswith(".") for part in rel.parts[:-1]):
             continue
-        name = path.name
-        if name in DEP_KEYS and path.parent == repo_dir:
-            deps[DEP_KEYS[name]] = name
-        if path.suffix == ".ipynb":
-            notebooks.append(_scan_notebook(rel, path))
-        elif path.suffix == ".py":
+        if p.name.startswith("."):
+            continue
+        ext = p.suffix.lower().lstrip(".")
+        if ext == "ipynb":
             try:
-                text = path.read_text(errors="ignore")
-            except OSError:
-                continue
-            scripts.append({"path": rel, "has_main": "if __name__" in text,
-                            "n_lines": len(text.splitlines())})
-        elif path.suffix in SPEC_TEXT_EXTS and _is_spec_text(path):
-            spec_texts.append({"path": rel})
-        elif path.suffix in DATA_EXTS:
+                obj = json.loads(p.read_text())
+            except Exception:
+                obj = {}
+            meta = obj.get("metadata", {}) if isinstance(obj, dict) else {}
+            ks = meta.get("kernelspec", {}) if isinstance(meta, dict) else {}
+            kernel = ks.get("name", "unknown") if isinstance(ks, dict) else "unknown"
+            if not kernel:
+                kernel = "unknown"
+            cells = obj.get("cells", []) if isinstance(obj, dict) else []
+            has_outputs = False
+            for c in cells:
+                if not isinstance(c, dict):
+                    continue
+                outs = c.get("outputs")
+                if outs:
+                    has_outputs = True
+                    break
+                ec = c.get("execution_count")
+                if ec is not None:
+                    has_outputs = True
+                    break
+            notebooks.append({"path": str(rel), "kernel": kernel,
+                             "cells": len(cells), "has_outputs": has_outputs})
+        elif ext == "py":
+            scripts.append({"path": str(rel), "has_main": _has_main(p)})
+        elif ext in ("yaml", "yml"):
+            specs.append({"path": str(rel)})
+        elif ext == "md":
+            name_l = p.name.lower()
             try:
-                size = path.stat().st_size
+                text_l = p.read_text(errors="replace").lower()
             except OSError:
-                size = 0  # e.g. broken symlink — record with 0 bytes
-            data_files.append({"path": rel, "bytes": size})
-    return {"notebooks": notebooks, "scripts": scripts, "spec_texts": spec_texts,
-            "data_files": data_files, "deps": deps}
+                text_l = ""
+            if any(k in name_l or k in text_l
+                   for k in ("strateg", "signal", "backtest")):
+                specs.append({"path": str(rel)})
+        elif ext in DATA_EXTS:
+            data.append({"path": str(rel), "bytes": p.stat().st_size})
+    # sort specs? test expects notes.md before strategy.yaml (sorted by path)
+    specs.sort(key=lambda x: x["path"])
+    notebooks.sort(key=lambda x: x["path"])
+    scripts.sort(key=lambda x: x["path"])
+    data.sort(key=lambda x: x["path"])
+    deps = {
+        "requirements_txt": (tree / "requirements.txt").is_file(),
+        "environment_yml": (tree / "environment.yml").is_file(),
+        "setup_py": (tree / "setup.py").is_file(),
+    }
+    return {
+        "notebooks": notebooks,
+        "scripts": scripts,
+        "specs": specs,
+        "data": data,
+        "deps": deps,
+        "counts": {
+            "notebooks": len(notebooks),
+            "scripts": len(scripts),
+            "specs": len(specs),
+            "data": len(data),
+        },
+    }
 
 
-def harvest_one(owner_repo: str, out_root: Path) -> tuple[str, str]:
-    """Clone + manifest one repo. Returns (status, detail):
-    status is 'ok' | 'skip' | 'error'."""
-    if not SLUG_RE.fullmatch(owner_repo):
-        return "error", f"{owner_repo}: expected OWNER/REPO"
-    dest = out_root / repo_slug(owner_repo)
-    manifest_path = dest / "manifest.json"
+def publish(manifest: dict, path: Path) -> None:
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        sha = remote_sha(owner_repo)
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        return "error", f"{owner_repo}: ls-remote failed: {exc}"
-    if sha is None:
-        return "error", f"{owner_repo}: unreachable (ls-remote failed)"
-    if manifest_path.exists():
-        try:
-            old = json.loads(manifest_path.read_text())
-            if old.get("sha") == sha:
-                return "skip", f"{owner_repo} already at {sha[:12]}"
-        except (json.JSONDecodeError, OSError):
-            pass  # torn manifest — fall through to a fresh clone
-    try:
-        clone(owner_repo, dest)
-    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
-        return "error", f"{owner_repo}: {exc}"
-    try:
-        manifest = scan(dest)
-    except OSError as exc:
-        return "error", f"{owner_repo}: scan failed: {exc}"
-    manifest.update({
-        "repo": owner_repo,
-        "sha": sha,
-        "cloned_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    })
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(manifest, indent=2) + "\n")
-    tmp.replace(manifest_path)
-    counts = {k: len(manifest[k]) for k in
-              ("notebooks", "scripts", "spec_texts", "data_files")}
-    return "ok", f"{owner_repo} @ {sha[:12]}  {counts}"
+        tmp.write_text(json.dumps(manifest))
+    except OSError:
+        tmp.unlink(missing_ok=True)  # never leave a stray .tmp behind
+        raise
+    tmp.replace(path)
 
 
-def main_with(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("repos", nargs="*", metavar="OWNER/REPO",
-                    help="GitHub repos to clone and inventory")
-    ap.add_argument("--repos-file", type=Path, default=None,
-                    help="file with one OWNER/REPO per line")
-    ap.add_argument("--out", type=Path, default=REPOS)
-    args = ap.parse_args(argv)
-
-    repos = list(args.repos)
+def main_with(argv=None, root=None) -> int:
+    if root is None:
+        root = ROOT
+    root = Path(root)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("specs", nargs="*", default=[])
+    parser.add_argument("--repos", dest="repos_file", default=None)
+    parser.add_argument("--root", dest="root_override", default=None)
+    args = parser.parse_args(argv)
+    if args.root_override is not None:
+        root = Path(args.root_override)
+    specs: list[str] = list(args.specs)
     if args.repos_file:
-        repos += [line.strip() for line in
-                  args.repos_file.read_text().splitlines() if line.strip()]
-    if not repos:
-        sys.exit("error: give OWNER/REPO args or --repos-file")
-
-    args.out.mkdir(parents=True, exist_ok=True)
-    ok = skip = failed = 0
-    for repo in repos:
-        status, detail = harvest_one(repo, args.out)
-        if status == "ok":
-            ok += 1
-            print(detail)
-        elif status == "skip":
-            skip += 1
-            print(detail)
-        else:
+        specs.extend(repos_from_file(Path(args.repos_file)))
+    failed = 0
+    for spec in dict.fromkeys(specs):
+        try:
+            owner, name = parse_repo_spec(spec)
+            dest = repo_dir(owner, name, root)
+            manifest_path = dest / "manifest.json"
+            skip = False
+            reclone = False
+            if manifest_path.exists():
+                try:
+                    existing = json.loads(manifest_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    existing = None
+                rec = existing.get("repo", {}) if isinstance(existing, dict) else {}
+                if rec.get("owner") != owner or rec.get("name") != name:
+                    reclone = True  # the directory holds a different repo
+                elif isinstance(rec.get("sha"), str):
+                    try:
+                        head = rev_parse(dest)
+                    except RuntimeError:
+                        reclone = True  # broken clone: a fresh clone repairs it
+                    else:
+                        if head == rec["sha"]:
+                            skip = True
+            if skip:
+                print(f"skip {owner}/{name}")
+                continue
+            if reclone and dest.exists():
+                shutil.rmtree(dest)
+            if not dest.exists():
+                clone_repo(owner, name, dest)
+            body = inventory(dest)
+            manifest = {"repo": {
+                "owner": owner,
+                "name": name,
+                "url": repo_url(owner, name),
+                "sha": rev_parse(dest),
+                "cloned_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }}
+            manifest.update(body)
+            publish(manifest, manifest_path)
+            print(f"harvested {owner}/{name}: {manifest['counts']}")
+        except (ValueError, RuntimeError) as e:
+            print(f"error {spec}: {e}", file=sys.stderr)
             failed += 1
-            print(detail, file=sys.stderr)
-    print(f"\n{ok} cloned, {skip} skipped, {failed} failed -> {args.out}")
-    return 1 if failed == len(repos) else 0
-
-
-def main() -> int:
-    return main_with()
+    if failed:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main_with())

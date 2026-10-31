@@ -25,7 +25,7 @@ meta:
 data:
   universe: [SPY]                      # tickers, or catalog ids: fred:DGS10, yahoo:SPY
                                        # (find them: python3 catalog.py search <query>)
-  bar: 1d                              # 1d | 1h | 5m | ...
+  bar: 1d                              # daily bars only
   fields: [open, high, low, close, volume]
   start: 1993-01-29
   end: null                            # null = today

@@ -123,6 +123,9 @@ class TestMain:
 
         def fake_get(self, url, **k):
             calls.append(url)
+            if "start=2" in url:
+                return type("EmptyResp", (), {"text": "<feed />",
+                                                "raise_for_status": lambda self: None})()
             return FakeResp()
 
         monkeypatch.setattr(harvest_arxiv.requests.Session, "get", fake_get)
@@ -157,9 +160,46 @@ class TestMain:
             return FakeResp()
 
         monkeypatch.setattr(harvest_arxiv.requests.Session, "get", fake_get)
-        # limit 4 > 2 per page -> second page requested; fixture returns same
-        # 2 entries, which are already seen -> runner stops after empty page 2
+        # The short first page proves the API is exhausted immediately.
         harvest_arxiv.main_with(["--out", str(out), "--pages", str(pages),
                                  "--sleep", "0", "--limit", "4"])
-        assert any("start=100" in c for c in calls)
+        assert len(calls) == 1
+        assert len(out.read_text().splitlines()) == 2
+
+    def test_known_page_does_not_hide_later_new_results(self, tmp_path, monkeypatch):
+        out, pages, calls = self._wire(tmp_path, monkeypatch)
+        monkeypatch.setattr(harvest_arxiv, "PAGE_SIZE", 2)
+        known = harvest_arxiv.parse_atom(ATOM_PAGE)
+        out.write_text("".join(json.dumps(row) + "\n" for row in known))
+        later_page = ATOM_PAGE.replace("02834", "09999").replace("02835", "09998")
+
+        class FakeResp:
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                pass
+
+        def fake_get(self, url, **kwargs):
+            calls.append(url)
+            return FakeResp(later_page if "start=2" in url else ATOM_PAGE)
+
+        monkeypatch.setattr(harvest_arxiv.requests.Session, "get", fake_get)
+        harvest_arxiv.main_with(["--out", str(out), "--pages", str(pages),
+                                 "--sleep", "0", "--limit", "2"])
+        assert any("start=2" in url for url in calls)
+        assert len(out.read_text().splitlines()) == 4
+
+    def test_stops_after_bounded_known_pages(self, tmp_path, monkeypatch):
+        out, pages, calls = self._wire(tmp_path, monkeypatch)
+        monkeypatch.setattr(harvest_arxiv, "PAGE_SIZE", 2)
+        monkeypatch.setattr(harvest_arxiv, "MAX_CONSECUTIVE_KNOWN_PAGES", 2)
+        known = harvest_arxiv.parse_atom(ATOM_PAGE)
+        out.write_text("".join(json.dumps(row) + "\n" for row in known))
+
+        harvest_arxiv.main_with(
+            ["--out", str(out), "--pages", str(pages), "--sleep", "0", "--limit", "2"]
+        )
+
+        assert len(calls) == 2
         assert len(out.read_text().splitlines()) == 2

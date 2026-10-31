@@ -81,6 +81,15 @@ class TestSmokeTest:
         assert codegen.smoke_test(f, {"lookback": 10}) is None
         assert codegen.smoke_test(f, {}) is not None
 
+    def test_hanging_module_times_out_without_blocking_runner(self, tmp_path, monkeypatch):
+        f = self.write_module(tmp_path, "while True:\n    pass\n")
+        monkeypatch.setattr(codegen, "SMOKE_TIMEOUT", 0.1)
+        assert "timed out" in codegen.smoke_test(f, {})
+
+    def test_system_exit_is_a_smoke_failure(self, tmp_path):
+        f = self.write_module(tmp_path, "raise SystemExit(0)\n")
+        assert "smoke worker failed" in codegen.smoke_test(f, {})
+
 
 class TestStripFence:
     def test_bare_source(self):
@@ -139,7 +148,7 @@ class TestMultiContract:
             "    return pd.DataFrame(1.0 / len(data), index=idx, columns=list(data))\n"
         ))
         params = {"AAA": codegen.smoke_frame(), "BBB": codegen.smoke_frame()}
-        assert codegen.smoke_test(f, params, multi=True) is None
+        assert codegen.smoke_test(f, {}, multi=True, data=params) is None
 
     def test_multi_smoke_rejects_series_output(self, tmp_path):
         f = self.write_module(tmp_path, (
@@ -149,7 +158,7 @@ class TestMultiContract:
             "    return pd.Series(1.0, index=idx)\n"
         ))
         params = {"AAA": codegen.smoke_frame(), "BBB": codegen.smoke_frame()}
-        err = codegen.smoke_test(f, params, multi=True)
+        err = codegen.smoke_test(f, {}, multi=True, data=params)
         assert err is not None and "DataFrame" in err
 
     def test_multi_smoke_rejects_wrong_columns(self, tmp_path):
@@ -160,7 +169,7 @@ class TestMultiContract:
             "    return pd.DataFrame(0.5, index=idx, columns=['AAA', 'ZZZ'])\n"
         ))
         params = {"AAA": codegen.smoke_frame(), "BBB": codegen.smoke_frame()}
-        err = codegen.smoke_test(f, params, multi=True)
+        err = codegen.smoke_test(f, {}, multi=True, data=params)
         assert err is not None and "columns" in err and "universe" in err
 
 
@@ -419,6 +428,8 @@ class TestMainCircuitBreaker:
         monkeypatch.setattr(codegen, "SPECS", specs)
         monkeypatch.setattr(codegen, "STRATEGIES", strategies)
 
+        monkeypatch.setattr(codegen.llm, "preflight", lambda: None)
+
         def fake_complete(prompt, **k):
             raise llm.LLMError("opencode exited 1: auth expired")
 
@@ -430,3 +441,15 @@ class TestMainCircuitBreaker:
         # only the first K=3 slugs got an .error marker
         markers = sorted(strategies.glob("*.error"))
         assert len(markers) == 3
+
+
+@pytest.mark.parametrize('lookback,expected', [(2, 'coded'), (20, 'codegen_failed')])
+def test_portfolio_smoke_uses_configured_parameters(tmp_path, lookback, expected):
+    spec = {'signal': {'definition': 'x', 'lag_bars': 1, 'lookback': lookback},
+            'data': {'universe': ['AAA', 'BBB']}}
+    source = ('import pandas as pd\n'
+              'def signal(data, lookback=2):\n'
+              '    if lookback > 10: raise ValueError("configured lookback fails")\n'
+              '    return pd.DataFrame(0.5, index=next(iter(data.values())).index, columns=list(data))\n')
+    assert codegen.publish({'slug': 'portfolio', 'source': source}, spec, tmp_path) == expected
+    assert (tmp_path / 'portfolio.py').exists() == (expected == 'coded')

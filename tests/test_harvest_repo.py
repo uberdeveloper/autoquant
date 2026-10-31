@@ -1,143 +1,220 @@
-"""Tests for harvest_repo.py — all filesystem-fake, no network, no git."""
+"""Tests for harvest_repo.py — clone argv, SHA-pinned resume, inventory, publish."""
+from __future__ import annotations
+
 import json
-from pathlib import Path
+import subprocess
 
-import harvest_repo as hr
+import pytest
 
-
-def make_repo(tmp_path: Path) -> Path:
-    """A tiny fake cloned repo with one of every artifact kind."""
-    nb = {"cells": [
-        {"cell_type": "code", "outputs": [{"data": {}}], "source": ["x=1"]},
-        {"cell_type": "markdown", "outputs": [], "source": ["# hi"]},
-    ], "metadata": {"kernelspec": {"name": "python3"}}}
-    (tmp_path / "nb").mkdir()
-    (tmp_path / "nb" / "demo.ipynb").write_text(json.dumps(nb))
-    (tmp_path / "run_me.py").write_text("import pandas\n\nif __name__ == '__main__':\n    pass\n")
-    (tmp_path / "lib.py").write_text("def helper():\n    return 1\n")
-    (tmp_path / "strategy.md").write_text("# Mean reversion\n\nEntry when z < -2, exit at 0.")
-    (tmp_path / "notes.txt").write_text("not a spec, not scanned")
-    (tmp_path / "prices.csv").write_text("date,close\n2020-01-02,100\n")
-    (tmp_path / "requirements.txt").write_text("pandas==1.3.0\n")
-    return tmp_path
+import harvest_repo
 
 
-class TestScan:
-    def test_notebooks(self, tmp_path):
-        m = hr.scan(make_repo(tmp_path))
-        assert m["notebooks"] == [{"path": "nb/demo.ipynb", "kernel": "python3",
-                                   "has_outputs": True, "n_cells": 2}]
-
-    def test_scripts_flag_mains(self, tmp_path):
-        m = hr.scan(make_repo(tmp_path))
-        by_path = {s["path"]: s for s in m["scripts"]}
-        assert by_path["run_me.py"]["has_main"] is True
-        assert by_path["lib.py"]["has_main"] is False
-        assert by_path["run_me.py"]["n_lines"] == 4
-
-    def test_spec_texts_keyword_gate(self, tmp_path):
-        m = hr.scan(make_repo(tmp_path))
-        assert [s["path"] for s in m["spec_texts"]] == ["strategy.md"]
-
-    def test_data_files(self, tmp_path):
-        m = hr.scan(make_repo(tmp_path))
-        assert m["data_files"] == [{"path": "prices.csv",
-                                    "bytes": len("date,close\n2020-01-02,100\n")}]
-
-    def test_deps_declared(self, tmp_path):
-        m = hr.scan(make_repo(tmp_path))
-        assert m["deps"]["requirements_txt"] == "requirements.txt"
-        assert m["deps"]["environment_yml"] is None
-
-    def test_skips_git_and_cruft(self, tmp_path):
-        r = make_repo(tmp_path)
-        (r / ".git").mkdir()
-        (r / ".git" / "evil.ipynb").write_text("{}")
-        (r / "__pycache__").mkdir()
-        (r / "__pycache__" / "x.py").write_text("x=1")
-        m = hr.scan(r)
-        assert all(".git" not in s["path"] for s in m["notebooks"])
-        assert all("__pycache__" not in s["path"] for s in m["scripts"])
-
-    def test_unparsable_notebook_recorded(self, tmp_path):
-        r = make_repo(tmp_path)
-        (r / "broken.ipynb").write_text("{not json")
-        m = hr.scan(r)
-        assert m["notebooks"][0]["unparsable"] is True
-
-    def test_broken_symlink_does_not_crash(self, tmp_path):
-        import os
-        r = make_repo(tmp_path)
-        os.symlink("/nonexistent", r / "broken.csv")
-        m = hr.scan(r)
-        by_path = {d["path"]: d for d in m["data_files"]}
-        assert by_path["broken.csv"]["bytes"] == 0
+def make_repo(tmp_path):
+    """A local stand-in for a cloned repo (tests never touch the network)."""
+    repo = tmp_path / "src-repo"
+    (repo / "data").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    (repo / "backtest.py").write_text("if __name__ == '__main__':\n    pass\n")
+    (repo / "strategy.yaml").write_text("signal: {}\n")
+    (repo / "README.md").write_text("# readme\n")
+    (repo / "notes.md").write_text("strategy notes\n")
+    nb = {"metadata": {"kernelspec": {"name": "python3"}},
+          "cells": [{"cell_type": "code", "outputs": [], "execution_count": None,
+                     "source": ["print(1)"]}]}
+    (repo / "01.ipynb").write_text(json.dumps(nb))
+    (repo / "data" / "spy.csv").write_text("date,close\n2020-01-01,100\n")
+    (repo / "requirements.txt").write_text("pandas\n")
+    return repo
 
 
-class TestHarvestOne:
-    def test_clones_and_writes_manifest(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(hr, "remote_sha", lambda r: "a" * 40)
-        calls = []
-        monkeypatch.setattr(hr, "clone", lambda repo, dest: calls.append((repo, dest)))
-        status, detail = hr.harvest_one("o/r", tmp_path)
-        assert status == "ok"
-        assert calls == [("o/r", tmp_path / "o-r")]
-        m = json.loads((tmp_path / "o-r" / "manifest.json").read_text())
-        assert m["repo"] == "o/r" and m["sha"] == "a" * 40
-        assert "cloned_at" in m
+@pytest.fixture
+def cloned(monkeypatch, tmp_path):
+    """Redirect git calls: `clone` copies the fixture, `rev-parse` echoes a SHA.
 
-    def test_skip_when_same_sha(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(hr, "remote_sha", lambda r: "a" * 40)
-        dest = tmp_path / "o-r"
-        dest.mkdir()
-        (dest / "manifest.json").write_text(json.dumps({"sha": "a" * 40}))
-        status, _ = hr.harvest_one("o/r", tmp_path)
-        assert status == "skip"
+    Returns (repo, dest_holder, shas, git) where git holds a `clones` list of
+    clone destinations (count invocations) and a `flags` dict; setting
+    `flags["broken"]` makes rev-parse raise RuntimeError until a fresh clone
+    repairs the repo.
+    """
+    repo = make_repo(tmp_path)
+    dest_holder = {}
+    shas = {"head": "a" * 40}
+    clones: list[str] = []
+    flags = {"broken": False}
+    real_run = subprocess.run
 
-    def test_reclone_when_sha_changed(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(hr, "remote_sha", lambda r: "b" * 40)
-        monkeypatch.setattr(hr, "clone", lambda repo, dest: None)
-        dest = tmp_path / "o-r"
-        dest.mkdir()
-        (dest / "manifest.json").write_text(json.dumps({"sha": "a" * 40}))
-        status, _ = hr.harvest_one("o/r", tmp_path)
-        assert status == "ok"
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["git", "clone"]:
+            dest = argv[-1]
+            dest_holder["dest"] = dest
+            clones.append(dest)
+            flags["broken"] = False  # a fresh clone repairs the checkout
+            real_run(["cp", "-r", str(repo), dest], check=True)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:2] == ["git", "-C"] and argv[3] == "rev-parse":
+            assert argv[2] == dest_holder.get("dest"), (
+                f"rev-parse against unexpected dir: {argv[2]!r}")
+            if flags["broken"]:
+                raise RuntimeError("fatal: not a git repository")
+            return subprocess.CompletedProcess(argv, 0, shas["head"] + "\n", "")
+        raise AssertionError(f"unexpected git argv: {argv}")
 
-    def test_unreachable_repo_is_error_not_crash(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(hr, "remote_sha", lambda r: None)
-        status, detail = hr.harvest_one("o/gone", tmp_path)
-        assert status == "error"
-
-    def test_malformed_slug_is_error_before_network(self, tmp_path, monkeypatch):
-        def boom(r):
-            raise AssertionError("remote_sha must not be called")
-        monkeypatch.setattr(hr, "remote_sha", boom)
-        status, detail = hr.harvest_one("..", tmp_path)
-        assert status == "error"
-        assert "expected OWNER/REPO" in detail
+    monkeypatch.setattr(harvest_repo.subprocess, "run", fake_run)
+    return repo, dest_holder, shas, {"clones": clones, "flags": flags}
 
 
-class TestMainWith:
-    def test_reports_and_exits_zero(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(hr, "REPOS", tmp_path / "repos")
-        monkeypatch.setattr(hr, "remote_sha", lambda r: "a" * 40)
-        monkeypatch.setattr(hr, "clone", lambda repo, dest: None)
-        rc = hr.main_with(["o/r"])
+class TestCloneArgv:
+    def test_shallow_clone(self, monkeypatch):
+        seen = {}
+
+        def fake(argv, **kw):
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(harvest_repo.subprocess, "run", fake)
+        harvest_repo.clone_repo("o", "r", "/tmp/dest")
+        assert seen["argv"][:4] == ["git", "clone", "--depth", "1"]
+        assert seen["argv"][-1] == "/tmp/dest"
+        assert "github.com/o/r" in seen["argv"][-2]
+
+
+class TestInventory:
+    def test_classifies_artifacts(self, tmp_path):
+        m = harvest_repo.inventory(make_repo(tmp_path))
+        assert m["notebooks"] == [{"path": "01.ipynb", "kernel": "python3",
+                                   "cells": 1, "has_outputs": False}]
+        assert m["scripts"] == [{"path": "backtest.py", "has_main": True}]
+        assert m["specs"] == [{"path": "notes.md"}, {"path": "strategy.yaml"}]
+        assert m["data"] == [{"path": "data/spy.csv", "bytes": 26}]
+        assert m["deps"] == {"requirements_txt": True, "environment_yml": False,
+                             "setup_py": False}
+        assert m["counts"] == {"notebooks": 1, "scripts": 1, "specs": 2, "data": 1}
+
+    def test_notebook_with_outputs(self, tmp_path):
+        nb = {"metadata": {"kernelspec": {"name": "python3"}},
+              "cells": [{"cell_type": "code", "outputs": [{"text": "1"}],
+                         "execution_count": 1}]}
+        (tmp_path / "x.ipynb").write_text(json.dumps(nb))
+        m = harvest_repo.inventory(tmp_path)
+        assert m["notebooks"][0]["has_outputs"] is True
+
+    def test_ignores_git_and_venv(self, tmp_path):
+        (tmp_path / ".git" / "objects").mkdir(parents=True)
+        (tmp_path / ".venv" / "lib").mkdir(parents=True)
+        (tmp_path / "__pycache__").mkdir()
+        (tmp_path / ".venv" / "lib" / "x.py").write_text("x = 1\n")
+        assert harvest_repo.inventory(tmp_path)["scripts"] == []
+
+
+class TestPublish:
+    def test_atomic_valid_json(self, tmp_path):
+        out = tmp_path / "manifest.json"
+        harvest_repo.publish({"a": 1}, out)
+        assert json.loads(out.read_text()) == {"a": 1}
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_publish_leaves_no_tmp_on_failure(self, tmp_path, monkeypatch):
+        # A mid-write failure (e.g. disk full) must not leave a stray .tmp.
+        out = tmp_path / "manifest.json"
+        real_write_text = harvest_repo.Path.write_text
+
+        def failing_write_text(self, data, *args, **kwargs):
+            real_write_text(self, data, *args, **kwargs)
+            raise OSError("disk full")
+
+        monkeypatch.setattr(harvest_repo.Path, "write_text", failing_write_text)
+        with pytest.raises(OSError, match="disk full"):
+            harvest_repo.publish({"a": 1}, out)
+        monkeypatch.undo()
+        assert not list(tmp_path.glob("*.tmp"))
+
+
+class TestResume:
+    def test_second_run_is_a_noop(self, tmp_path, cloned, capsys):
+        repo, dest_holder, shas, git = cloned
+        dest = tmp_path / "data" / "repos" / "o-r"
+        args = ["o/r"]
+        # first run: clones + writes manifest
+        harvest_repo.main_with(args, root=tmp_path)
+        first = json.loads((dest / "manifest.json").read_text())
+        assert first["repo"]["sha"] == "a" * 40
+        assert len(git["clones"]) == 1
+        capsys.readouterr()
+        # second run at the same SHA: no second clone, manifest unchanged
+        before = (dest / "manifest.json").read_text()
+        harvest_repo.main_with(args, root=tmp_path)
+        assert (dest / "manifest.json").read_text() == before
+        assert len(git["clones"]) == 1
+        assert "skip o/r" in capsys.readouterr().out
+
+    def test_changed_sha_reinventories(self, tmp_path, cloned):
+        repo, dest_holder, shas, git = cloned
+        dest = tmp_path / "data" / "repos" / "o-r"
+        harvest_repo.main_with(["o/r"], root=tmp_path)
+        shas["head"] = "b" * 40
+        (dest / "backtest.py").write_text("# changed upstream\n")
+        harvest_repo.main_with(["o/r"], root=tmp_path)
+        after = json.loads((dest / "manifest.json").read_text())
+        assert after["repo"]["sha"] == "b" * 40
+
+    def test_name_collision_reclones(self, tmp_path, cloned):
+        # `a/b-c` and `a-b/c` both map to data/repos/a-b-c: the second spec
+        # must re-clone, not be skipped as an already-harvested repo.
+        repo, dest_holder, shas, git = cloned
+        dest = tmp_path / "data" / "repos" / "a-b-c"
+        harvest_repo.main_with(["a/b-c", "a-b/c"], root=tmp_path)
+        manifest = json.loads((dest / "manifest.json").read_text())
+        assert manifest["repo"]["owner"] == "a-b"
+        assert manifest["repo"]["name"] == "c"
+        assert len(git["clones"]) == 2
+
+    def test_broken_clone_is_recloned(self, tmp_path, cloned):
+        # A git failure on an existing clone repairs via re-clone + republish,
+        # instead of surfacing a RuntimeError or re-inventorying the stale tree.
+        repo, dest_holder, shas, git = cloned
+        dest = tmp_path / "data" / "repos" / "o-r"
+        harvest_repo.main_with(["o/r"], root=tmp_path)
+        assert len(git["clones"]) == 1
+        manifest_path = dest / "manifest.json"
+        tampered = json.loads(manifest_path.read_text())
+        tampered["repo"]["marker"] = "stale"  # a skip would leave this behind
+        manifest_path.write_text(json.dumps(tampered))
+        git["flags"]["broken"] = True
+        harvest_repo.main_with(["o/r"], root=tmp_path)
+        after = json.loads(manifest_path.read_text())
+        assert len(git["clones"]) == 2
+        assert "marker" not in after["repo"]  # republished, not skipped
+        assert after["repo"]["sha"] == "a" * 40
+
+
+class TestRepoSpec:
+    @pytest.mark.parametrize("bad", ["noslash", "a/b/c", "../escape", "/abs"])
+    def test_rejects_bad_spec(self, bad):
+        with pytest.raises(ValueError):
+            harvest_repo.parse_repo_spec(bad)
+
+    def test_error_containment_continues(self, tmp_path, cloned, capsys):
+        # One bad spec fails with a one-line stderr error (exit 1) while the
+        # remaining repos still get harvested.
+        repo, dest_holder, shas, git = cloned
+        rc = harvest_repo.main_with(["noslash", "o/r"], root=tmp_path)
+        assert rc == 1
+        assert (tmp_path / "data" / "repos" / "o-r" / "manifest.json").exists()
+        err = capsys.readouterr().err
+        assert "error noslash:" in err
+
+    def test_duplicate_specs_run_once(self, tmp_path, cloned, capsys):
+        # Exact duplicate specs are deduped: no second (noisy) skip pass.
+        repo, dest_holder, shas, git = cloned
+        rc = harvest_repo.main_with(["o/r", "o/r"], root=tmp_path)
         assert rc == 0
-        assert (tmp_path / "repos" / "o-r" / "manifest.json").exists()
+        out = capsys.readouterr().out
+        assert "harvested o/r" in out
+        assert "skip o/r" not in out
+        assert len(git["clones"]) == 1
 
-    def test_repos_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(hr, "REPOS", tmp_path / "repos")
-        monkeypatch.setattr(hr, "remote_sha", lambda r: "a" * 40)
-        monkeypatch.setattr(hr, "clone", lambda repo, dest: None)
-        repos_file = tmp_path / "repos.txt"
-        repos_file.write_text("o/one\no/two\n")
-        rc = hr.main_with(["--repos-file", str(repos_file)])
-        assert rc == 0
-        assert (tmp_path / "repos" / "o-one" / "manifest.json").exists()
-        assert (tmp_path / "repos" / "o-two" / "manifest.json").exists()
-
-    def test_all_errors_exit_nonzero(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(hr, "REPOS", tmp_path / "repos")
-        monkeypatch.setattr(hr, "remote_sha", lambda r: None)
-        assert hr.main_with(["o/gone"]) != 0
+    def test_reads_repos_file(self, tmp_path):
+        f = tmp_path / "repos.txt"
+        f.write_text("# comment\n\nLastAncientOne/Stock_Analysis_For_Quant\nAuquan/Tutorials\n")
+        assert harvest_repo.repos_from_file(f) == [
+            "LastAncientOne/Stock_Analysis_For_Quant", "Auquan/Tutorials"]

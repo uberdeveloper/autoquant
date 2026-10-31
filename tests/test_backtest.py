@@ -59,6 +59,13 @@ class TestBacktest:
         expected = (df["open"].shift(-1) / df["open"] - 1).fillna(0.0)
         assert np.allclose(res["asset_ret"], expected)
 
+    def test_next_open_rejects_missing_open_bar(self):
+        df = make_prices()
+        df = df.assign(open=df["open"].where(np.arange(len(df)) != 10))
+        spec = dict(BASE_SPEC, rules={"execution_price": "next_open"})
+        with pytest.raises(ValueError, match="invalid open"):
+            backtest.backtest(df, pd.Series(1.0, index=df.index), spec)
+
     def test_costs_reduce_gross_by_turnover_times_bps(self):
         df = make_prices()
         spec = {"signal": {}, "rules": {}, "costs": {"slippage_bps": 100}}
@@ -151,6 +158,24 @@ class TestBacktestMulti:
                              for t, d in data.items()})
         pos = (w * 0.5).shift(1).fillna(0.0)
         assert np.allclose(res["gross"], (pos * rets).sum(axis=1))
+
+    def test_next_open_rejects_mismatched_calendars(self):
+        data = make_panel()
+        data["BBB"] = data["BBB"].drop(data["BBB"].index[0])
+        spec = {**MULTI_SPEC, "rules": {"execution_price": "next_open", "max_leverage": 1.0}}
+        weights = pd.DataFrame(1.0, index=data["AAA"].index, columns=["AAA", "BBB"])
+        with pytest.raises(ValueError, match="identical trading calendars"):
+            backtest.backtest_multi(data, weights, spec)
+
+    def test_market_neutral_portfolio_reports_gross_exposure_and_leg_trades(self):
+        data = make_panel()
+        weights = pd.DataFrame({"AAA": 0.5, "BBB": -0.5}, index=data["AAA"].index)
+        result = backtest.backtest_multi(data, weights, MULTI_SPEC)
+        summary = backtest.metrics(result)
+        assert result["gross_exposure"].to_numpy()[1] == pytest.approx(1.0)
+        assert {"position__AAA", "position__BBB", "return__AAA", "return__BBB"} <= set(result)
+        assert summary["exposure"] > 0.9
+        assert summary["trades"] == 2
 
     def test_missing_weight_columns_filled_zero(self):
         data = make_panel()
@@ -246,6 +271,15 @@ class TestDeflatedSharpe:
         long = backtest.deflated_sharpe(1.5, 2520, 10)
         assert long > short
 
+    def test_default_trial_count_uses_unique_completed_slugs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(backtest, "ROOT", tmp_path)
+        path = tmp_path / "results" / "leaderboard.jsonl"
+        path.parent.mkdir()
+        path.write_text('{"slug": "one"}\n{"slug": "one"}\n{"slug": "two"}\n')
+
+        assert backtest.effective_trial_count("three", None) == 3
+        assert backtest.effective_trial_count("two", None) == 2
+
 
 class TestRandomEntryNull:
     def test_degenerate_all_cash_returns_note(self):
@@ -268,6 +302,21 @@ class TestRandomEntryNull:
         a = backtest.random_entry_null(res, BASE_SPEC, n=30, seed=7)
         b = backtest.random_entry_null(res, BASE_SPEC, n=30, seed=7)
         assert a == b
+
+    def test_portfolio_null_shuffles_complete_position_rows(self):
+        index = pd.date_range("2024-01-01", periods=4, freq="D")
+        res = pd.DataFrame({
+            "position__long": [0.5, 1.0, 0.0, 0.5],
+            "position__short": [-0.5, -1.0, 0.0, -0.5],
+            "return__long": [0.01, -0.02, 0.03, -0.01],
+            "return__short": [-0.01, 0.02, -0.03, 0.01],
+            "net": [0.01, -0.02, 0.03, -0.01],
+        }, index=index)
+
+        out = backtest.random_entry_null(res, BASE_SPEC, n=20, seed=3)
+
+        assert "actual_sharpe" in out
+        assert 0 <= out["percentile"] <= 100
 
 
 class TestAutoFlags:
@@ -362,6 +411,7 @@ class TestWriteReport:
             "param_sweep": {"lookback": {"100": 0.9, "200": 1.0}},
             "null_test": backtest.random_entry_null(res, BASE_SPEC, n=20),
             "deflated_sharpe": 0.9,
+            "n_trials": 3,
             "auto_flags": ["WEAK: does not beat buy-and-hold after costs"],
         }
         return tmp_path, spec, out
@@ -388,6 +438,13 @@ class TestWriteReport:
 
 
 class TestEndToEndRun:
+    def test_run_rejects_non_daily_data_before_loading_strategy(self, monkeypatch):
+        monkeypatch.setattr(backtest, "load_strategy", lambda slug: pytest.fail("loaded"))
+        spec = {"meta": {"slug": "intraday"}, "data": {"bar": "1h"}}
+
+        with pytest.raises(SystemExit, match="daily bars"):
+            backtest.run_spec(spec, None)
+
     def test_run_on_cached_prices_and_local_strategy(self, tmp_path, monkeypatch):
         monkeypatch.setattr(backtest, "ROOT", tmp_path)
 
@@ -411,7 +468,7 @@ class TestEndToEndRun:
                 "author_evidence": {"headline_metrics": "n/a", "sample": "n/a",
                                     "costs_included": False},
             },
-            "data": {"universe": ["SPY_TEST"], "start": "2020-01-01"},
+            "data": {"universe": ["SPY_TEST"], "bar": "1d", "start": "2020-01-01"},
             "signal": {"definition": "always long", "lag_bars": 1},
             "rules": {"max_leverage": 1.0},
             "costs": {"commission_bps": 5, "slippage_bps": 5},
@@ -465,7 +522,7 @@ class TestMultiUniverseRun:
                 "author_evidence": {"headline_metrics": "n/a", "sample": "n/a",
                                     "costs_included": False},
             },
-            "data": {"universe": ["AAA", "BBB"], "start": "2020-01-01"},
+            "data": {"universe": ["AAA", "BBB"], "bar": "1d", "start": "2020-01-01"},
             "signal": {"definition": "equal weight", "lag_bars": 1},
             "rules": {"max_leverage": 1.0},
             "costs": {"commission_bps": 5, "slippage_bps": 5},
@@ -536,6 +593,7 @@ class TestAppendLeaderboard:
             "full": backtest.metrics(res),
             "null_test": {"beats_null_95": True},
             "deflated_sharpe": 0.9,
+            "n_trials": 3,
             "auto_flags": ["WEAK: does not beat buy-and-hold after costs"],
         }
         return spec, out
@@ -549,6 +607,7 @@ class TestAppendLeaderboard:
         assert rows["verdict"] == "WEAKER"
         assert rows["net_sharpe"] == out["full"]["sharpe"]
         assert rows["deflated_sharpe"] == 0.9
+        assert rows["n_trials"] == 3
         assert rows["beats_null_95"] is True
         assert rows["flags"] == out["auto_flags"]
         assert "run_at" in rows
@@ -630,7 +689,7 @@ class TestOHLCVContract:
             "rules": {"execution_price": "next_open"},
             "costs": {"commission_bps": 10, "slippage_bps": 10},
             "validation": {},
-            "data": {"universe": ["fred:DGS10"], "start": "2020-01-01"},
+            "data": {"universe": ["fred:DGS10"], "bar": "1d", "start": "2020-01-01"},
         }
         idx = pd.bdate_range("2020-01-01", periods=60)
         close = pd.DataFrame({"close": np.linspace(100, 110, 60)}, index=idx)
@@ -649,3 +708,14 @@ class TestOHLCVContract:
 
         with pytest.raises(SystemExit, match="not in catalog"):
             backtest.load_prices("fred:NOPE_NOPE", None, None, tmp_path)
+
+
+@pytest.mark.parametrize('slice_start', [0, 2])
+def test_drawdown_includes_equity_before_first_return(slice_start):
+    idx = pd.bdate_range('2020-01-01', periods=6)
+    res = pd.DataFrame({'net': [0.1, 0.1, -0.5, 0, 0.01, 0],
+                        'pos': 1.0, 'cost': 0.0}, index=idx)
+    window = res if slice_start == 0 else res[res.index >= idx[slice_start]]
+    if slice_start == 0:
+        window = window.assign(net=[-0.5, 0, 0.01, 0, 0, 0])
+    assert backtest.metrics(window)['max_dd'] == -0.5

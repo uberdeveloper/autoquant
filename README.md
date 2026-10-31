@@ -23,6 +23,9 @@ python3 harvest_cboe.py           # [1] Cboe Insights (RSS; --backfill N for arc
 python3 harvest_arxiv.py          # [1] arXiv papers (abstract-as-body; --limit N, cap 1000)
 python3 fetch.py                  # [2] article text -> data/pages/
 python3 triage.py                 # [3] backtestability scores -> data/triage.jsonl
+python3 triage_repo.py            # [3b] repo artifact runnability verdicts -> data/repo_triage.jsonl
+python3 env_repo.py               # [3c] per-repo execution envs -> data/repo_envs.jsonl
+python3 run_external.py           # [3c] triaged repo artifacts -> results/external/leaderboard.jsonl
 python3 extract.py                # [4] triaged article -> specs/<slug>.yaml
 python3 codegen.py                # [5] spec -> strategies/<slug>.py (smoke-tested)
 python3 backtest_batch.py         # [6-8] every spec, isolated process, timeout-capped
@@ -62,6 +65,74 @@ python3 run_external.py --promote <repo>/<artifact>   # -> specs/ext-...yaml
 Repo code never touches the project env (per-repo uv venvs) and never
 touches the network (external_shim/ serves yfinance/pandas_datareader from
 the local price cache).
+
+### External artifact execution
+
+`run_external.py` executes the artifacts `triage_repo.py` scored: every
+notebook/script runs in its own process, in a *copy* of the checkout
+(`data/repos/` is never written), under the env its triage verdict asks for
+(our data via the offline shim, the repo's own data, or a built
+`env_repo.py` environment). One row per artifact lands in
+`results/external/leaderboard.jsonl` (resumable) next to the
+evidence of the run. The file is append-only *history*; its logical view is
+one row per artifact (the latest row of each `artifact_key`), and a
+repeated, unchanged verdict is not appended again -- a permanently skipped
+artifact does not grow the file on every run. Notebooks are executed with
+the standard library only
+(`json` + `exec`), so the per-cell timeout of a real Jupyter kernel is
+relaxed to one total timeout per artifact.
+
+**Evidence per artifact kind** (all under `results/external/<owner-name>/`):
+
+| kind | files written | note |
+| --- | --- | --- |
+| notebook | `<stem>.ipynb` (the executed notebook) and `<stem>.log` (captured stdout/stderr) | the `.ipynb`/`.log` exist only when the run got far enough to write them |
+| script | `<stem>.log` (the script's captured stdout/stderr) | a script has no executed notebook, so the log is its only evidence |
+
+An **empty** log is no evidence: it is removed and never listed in the
+row's `outputs`, so a row never points at a 0-byte file. A timeout keeps
+whatever the child printed before it hung.
+
+Files the artifact itself produced are copied to
+`results/external/<owner-name>/<stem>/`. The leaderboard row lists **only
+files that exist**; two artifacts of one repo whose names slug to the same
+stem get a short hash appended so their evidence never overwrites each
+other.
+
+**Resume.** Only a leaderboard row with `verdict: "ok"` is terminal. A
+`skip` (e.g. a `NEEDS_HEAVY_ENV` artifact whose `data/repo_envs.jsonl` row
+is not ready yet), `error` or `timeout` row is evidence, not completion:
+those artifacts are retried on the next run, so an artifact that waited for
+an environment runs as soon as its env row appears.
+
+**Isolation.** The artifact runs with the *run copy* as its working
+directory, in its own session/process group (`start_new_session=True`, so
+a timeout can kill the whole group). Symlinks are never copied as
+symlinks -- a symlink inside the checkout is snapshotted as a plain file
+and every other symlink is dropped -- so no write can reach
+`data/repos/` through the copy. An artifact path that is absolute or
+contains `..` is refused (the triage file is hand/LLM editable).
+
+**Promotion.** `run_external.py --promote <artifact>` scaffolds
+`specs/ext-*.yaml` plus a **placeholder** `strategies/<slug>.py` (a flat
+signal) so the spec can be smoke-tested by the existing lane -- the real
+rule is a human/LLM port, and the scaffold's verdict stays `PENDING`.
+
+* The publication date is **never** invented: without a date in the triage
+  row the promotion is refused -- pass `--posted YYYY-MM-DD` (the date the
+  artifact was published). The date sets `meta.posted` and
+  `validation.oos_start`, so the out-of-sample window is real. The value
+  must be exactly an ISO date (`YYYY-MM-DD`): a truncated or padded typo
+  (`2024-01-029`, `2024-01-02junk`) is refused, never silently truncated
+  into a different date.
+* Re-promoting an artifact that is already promoted is refused; pass
+  `--force` to overwrite it. A failed promotion leaves the tree exactly as
+  it was: if the scaffolded strategy fails the smoke test, the new files
+  are removed and a previous promotion is restored unchanged.
+* `SPEC_ARTIFACT` rows are **not executed**: they get `verdict: "skip"`
+  ("routed to promotion") in the leaderboard and are promoted instead.
+* When no triage symbol resolves, the universe falls back to `SPY` as a
+  placeholder and the fallback is recorded as an ambiguity in the spec.
 
 ### Swapping the LLM provider
 
@@ -131,8 +202,8 @@ Automated flags and the leaderboard):
 
 - monthly/vintage series (e.g. `fred:CPIAUCSL`) are released after the
   period they describe — using them directly gives lookahead bias;
-- a catalog series whose frequency differs from `data.bar` (e.g. a monthly
-  series in a daily panel) distorts Sharpe through phantom bars.
+- the harness supports daily bars only (`data.bar: 1d`); a catalog series
+  with another frequency (e.g. monthly) distorts Sharpe through phantom bars.
 
 Strategies that run with `execution_price: next_open` require an `open`
 column; close-only FRED series are rejected with a clear message, and the

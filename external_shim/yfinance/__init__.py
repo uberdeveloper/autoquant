@@ -1,85 +1,137 @@
-"""yfinance shim — serves the project price cache (issue #26).
+"""Stub ``yfinance`` served from the project's own price cache (issue #26).
 
-Injected via PYTHONPATH=external_shim so `import yfinance` resolves here in
-external code. Supported subset, on evidence from the pilot repos:
+External strategy repos call ``yf.download(...)`` and
+``yf.Ticker(...).history(...)``.  Without a shim those calls hit Yahoo
+(rate limits, flakiness, non-deterministic results).  With this package on
+``PYTHONPATH`` they are served from our catalog cache instead, offline.
 
-    yf.download(ticker | [tickers], start=, end=, ...)  -> DataFrame
-        single ticker: flat lowercase ohlcv frame
-        list: MultiIndex columns (ticker, field)
-    yf.Ticker(sym).history(period=, start=, end=, ...)  -> DataFrame
+Frame shape (documented, pinned by ``tests/test_shim.py``):
 
-Everything else (downloaders, search, screener, crawl) raises
-DataNotAvailable or AttributeError — loud and recorded, never a live fetch.
+* the normalized frame from ``catalog.load`` -- lowercase OHLCV, always a
+  ``close`` column, ascending ``DatetimeIndex``, filtered to
+  ``[start, end]``;
+* plus a ``Close`` alias column, because external code overwhelmingly reads
+  ``Close``;
+* flat columns -- deliberately NOT yfinance's MultiIndex, which would break
+  the simple ``df["Close"]`` access most notebooks use.
 
-Fidelity notes: multi-ticker download is all-or-nothing — any miss raises
-DataNotAvailable, unlike real yfinance's NaN-filled columns. MultiIndex
-column order is (ticker, field). Meaningful kwargs we cannot honor
-(period/interval/actions beyond the defaults) print one warning line to
-stderr per ignored value.
+**Daily bars only.**  The catalog holds daily frames; there is no intraday
+or weekly data behind it.  The ``interval`` argument is therefore *accepted
+and ignored*: a request for ``interval="1wk"`` is served with the same daily
+bars as ``interval="1d"``.  Weekly/intraday bars are never synthesized --
+that would fabricate data.
+
+A request that the cache cannot serve raises
+``external_shim._core.DataNotAvailable`` (re-exported here) instead of
+reaching Yahoo.
 """
 from __future__ import annotations
 
-import sys
+import re
 
 import pandas as pd
-from _aqdata import DataNotAvailable, frame_for  # noqa: F401
 
-__all__ = ["DataNotAvailable", "download", "Ticker"]
+try:  # package layout: imported as external_shim.yfinance
+    from .._core import DataNotAvailable, load_frame
+except ImportError:  # flat layout: external_shim/ itself is on sys.path
+    from _core import DataNotAvailable, load_frame
 
-FIELDS = ["open", "high", "low", "close", "volume"]
+__all__ = ["download", "Ticker", "DataNotAvailable"]
 
-
-def _warn(where: str, **ignored) -> None:
-    """One stderr line per kwarg whose value deviates from the default."""
-    for name, value in ignored.items():
-        if value is None or value is False:
-            continue
-        if name == "period" and value == "max":
-            continue
-        if name == "interval" and value == "1d":
-            continue
-        print(f"[aq-shim] yf.{where}: ignoring {name}={value!r} — serving "
-              f"full cached range", file=sys.stderr)
+#: yfinance-style period units the shim understands.  "mo" is months (as in
+#: yfinance); minutes are not supported -- the catalog is daily.
+_PERIOD_RE = re.compile(r"^(\d+)\s*(d|wk|w|mo|y)$")
 
 
-def _frame(symbol: str, start=None, end=None) -> pd.DataFrame:
-    df = frame_for(symbol, start, end)
-    cols = [c for c in FIELDS if c in df.columns]
-    if not cols:
-        raise DataNotAvailable(f"{symbol}: no ohlcv columns in cached data")
-    out = df[cols].copy()
-    if "close" in out:
-        # 2018-era code (auto_adjust=False default) reads data["Adj Close"]
-        out["Adj Close"] = out["close"]
-    # Pilot notebooks read both conventions: serve real-yfinance's
-    # capitalized names as aliases of the lowercase frame.
-    for c in FIELDS:
-        if c in out:
-            out[c.capitalize()] = out[c]
-    return out
+def _period_bounds(period, interval=None) -> tuple[object, object]:
+    """(start, end) for a yfinance-style ``period`` argument.
+
+    Supported: ``Nd`` (``5d`` -- the last N *trading* days), ``Nwk``/``Nw``
+    (weeks -- the two spellings mean the same window), ``Nmo``, ``Ny``, plus
+    ``ytd`` (start of the current year) and ``max`` (the whole cached
+    series).  Anything else raises ``ValueError``: an unparseable period
+    must not silently widen the window to "everything".
+
+    ``interval`` is accepted for call compatibility and ignored -- only
+    daily bars exist in the catalog.
+    """
+    if period is None:
+        return None, None
+    text = str(period).strip().lower()
+    if text in ("", "max"):
+        return None, None
+    end = pd.Timestamp.now().normalize()
+    if text == "ytd":
+        return pd.Timestamp(year=end.year, month=1, day=1), end
+    match = _PERIOD_RE.match(text)
+    if match is None:
+        raise ValueError(
+            f"unsupported period {period!r}: the offline shim serves daily "
+            "bars only -- use one of '1d', '5d', '1w', '1wk', '1mo', '1y', "
+            "'ytd', 'max'")
+    count = int(match.group(1))
+    if count <= 0:
+        raise ValueError(f"unsupported period {period!r}: count must be > 0")
+    unit = match.group(2)
+    if unit == "d":
+        # The last N trading days (yfinance semantics); bdate_range rolls a
+        # weekend/holiday end back to the last business day.
+        start = pd.bdate_range(end=end, periods=count)[0]
+    elif unit in ("w", "wk"):
+        # 'w' and 'wk' both mean weeks -- a value the regex accepts must
+        # not fall through to the year branch.
+        start = end - pd.Timedelta(weeks=count) + pd.Timedelta(days=1)
+    elif unit == "mo":
+        start = end - pd.DateOffset(months=count) + pd.Timedelta(days=1)
+    else:  # "y"
+        start = end - pd.DateOffset(years=count) + pd.Timedelta(days=1)
+    return start, end
 
 
-def pdr_override(*args, **kwargs) -> None:
-    """Old yfinance's pandas_datareader patch — a no-op here: the
-    pandas_datareader shim already serves the same cache."""
+def download(tickers, start=None, end=None, period=None, interval="1d",
+             progress=False, auto_adjust=True, actions=False, group_by="column",
+             threads=True, ignore_tz=None, repair=False, keepna=False,
+             prepost=False, proxy=None, rounding=False, timeout=10, session=None,
+             multi_level_index=True,
+             **kwargs) -> pd.DataFrame | dict[str, pd.DataFrame]:
+    """Serve cached prices for one or more tickers.
 
-
-def download(tickers, start=None, end=None, *, auto_adjust=True,
-             progress=False, group_by="column", period=None, interval=None,
-             actions=False, **kwargs):
-    _warn("download", period=period, interval=interval, actions=actions)
-    single = isinstance(tickers, str)
-    names = [tickers] if single else list(tickers)
-    frames = {t: _frame(t, start, end) for t in names}
+    A single ticker returns the flat frame (see the module docstring); a
+    list or dict of tickers returns a ``{ticker: frame}`` mapping.
+    """
+    if isinstance(tickers, dict):
+        names = list(tickers)
+        single = False
+    elif isinstance(tickers, (list, tuple, set)):
+        names = list(tickers)
+        single = False
+    else:
+        names = [tickers]
+        single = True
+    if not names:
+        raise ValueError("download() needs at least one ticker")
+    if start is None and end is None and period:
+        start, end = _period_bounds(period, interval)
+    frames = {name: load_frame("yahoo", str(name), start, end) for name in names}
     if single:
         return frames[names[0]]
-    return pd.concat(frames, axis=1, names=["ticker", "field"])
+    return frames
 
 
 class Ticker:
-    def __init__(self, symbol: str):
-        self.symbol = symbol
+    """Stub ticker -- ``history()`` is backed by the same cache as download()."""
 
-    def history(self, period="max", interval="1d", start=None, end=None, **kwargs):
-        _warn("Ticker.history", period=period, interval=interval)
-        return _frame(self.symbol, start, end)
+    def __init__(self, ticker, session=None, proxy=None):
+        self.ticker = str(ticker)
+
+    def history(self, period=None, start=None, end=None, interval="1d",
+                actions=False, auto_adjust=True,
+                **kwargs) -> pd.DataFrame:
+        if start is None and end is None and period:
+            start, end = _period_bounds(period, interval)
+        return load_frame("yahoo", self.ticker, start, end)
+
+    def download(self, period=None, start=None, end=None, interval="1d",
+                 **kwargs) -> pd.DataFrame:
+        return self.history(period=period, start=start, end=end,
+                            interval=interval, **kwargs)
