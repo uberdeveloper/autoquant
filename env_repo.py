@@ -655,7 +655,7 @@ def _failed_row(label: str, dest: Path, state: dict | None, error: str,
             "built_at": _now()}
 
 
-def _walk(root: Path, specs: list[str], strict: bool) -> list[tuple]:
+def _walk(root: Path, specs: list[str]) -> list[tuple]:
     """Enumerate repos as (dest, manifest|None, label, error|None).
 
     With specs: exactly those repos, each parsed with
@@ -663,8 +663,7 @@ def _walk(root: Path, specs: list[str], strict: bool) -> list[tuple]:
     required to have a manifest.  Without specs: every child directory of
     <root>/data/repos/ holding a manifest.json, sorted.  The owner/name label
     always comes from the manifest's repo record, never from the directory
-    name.  In strict mode a corrupt manifest raises json.JSONDecodeError;
-    otherwise it is contained per repo as an error entry.
+    name.  A corrupt manifest is contained per repo as an error entry.
     """
     out: list[tuple] = []
 
@@ -678,8 +677,6 @@ def _walk(root: Path, specs: list[str], strict: bool) -> list[tuple]:
         try:
             manifest = json.loads(manifest_path.read_text())
         except json.JSONDecodeError as exc:
-            if strict:
-                raise
             out.append((dest, None, spec or dest.name,
                         f"corrupt manifest: {exc}"))
             return
@@ -702,16 +699,6 @@ def _walk(root: Path, specs: list[str], strict: bool) -> list[tuple]:
                 if child.is_dir():
                     add(child, None)
     return out
-
-
-def repo_manifests(root: Path, specs: list[str]) -> list[tuple[Path, dict, str]]:
-    """Locate (dest, manifest, label) for every repo to build an env for.
-
-    Raises ValueError for a malformed spec or a missing manifest, and
-    json.JSONDecodeError for a corrupt manifest.
-    """
-    return [(dest, manifest, label)
-            for dest, manifest, label, _err in _walk(root, specs, strict=True)]
 
 
 def _reusable(prev: dict | None, state: dict, root: Path) -> bool:
@@ -771,7 +758,7 @@ def main_with(argv: list[str] | None = None, root: Path | None = None) -> int:
             return 1
 
     try:
-        entries = _walk(root, specs, strict=False)
+        entries = _walk(root, specs)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
