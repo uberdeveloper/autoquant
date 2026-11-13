@@ -17,6 +17,7 @@ export default defineConfig({
         // forced eager for the landing page.
         manualChunks(id) {
           if (id.includes("snapshot.json")) return "snapshot";
+          if (id.includes("workspace.json")) return "workspace";
         },
       },
     },

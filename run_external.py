@@ -196,7 +196,8 @@ def record_failure(row: dict, path: Path) -> None:
         raise
 
 
-def append_row(row: dict, path: Path) -> None:
+def append_row(row: dict, path: Path,
+               seen: dict[str, dict] | None = None) -> None:
     """Append one leaderboard row.
 
     The file stays **append-only** (other readers may rely on the history),
@@ -207,10 +208,14 @@ def append_row(row: dict, path: Path) -> None:
     (three runs of a skipped artifact used to leave three rows).  A changed
     verdict (skip -> error -> ok) IS appended: the history then shows how
     the artifact behaved.
+
+    ``seen`` is the caller's in-memory ``latest_by_key`` view, so a batch
+    does not re-read the whole file for every row.
     """
     key = row.get("artifact_key")
     if key:
-        previous = latest_by_key(load_jsonl(path)).get(key)
+        previous = (seen.get(key) if seen is not None
+                    else latest_by_key(load_jsonl(path)).get(key))
         if (previous is not None
                 and previous.get("verdict") == row.get("verdict")
                 and previous.get("reason") == row.get("reason")):
@@ -218,6 +223,8 @@ def append_row(row: dict, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as fh:
         fh.write(json.dumps(row) + "\n")
+    if key and seen is not None:
+        seen[key] = row
 
 
 # ------------------------------------------------------------------- keys
@@ -527,6 +534,7 @@ import io
 import json
 import re
 import sys
+import time
 import traceback
 
 nb_path, out_path, log_path = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -609,6 +617,7 @@ def _flush():
 log = open(log_path, "w")
 if cells_note:
     log.write(cells_note + "\n")
+last_flush = 0.0
 try:
     for i, cell in enumerate(nb["cells"]):
         if not isinstance(cell, dict) or cell.get("cell_type") != "code":
@@ -644,7 +653,10 @@ try:
         ]
         log.write(out.getvalue())
         log.write(err.getvalue())
-        _flush()
+        now = time.monotonic()
+        if executed == 1 or now - last_flush >= 1.0:
+            _flush()
+            last_flush = now
     _flush()
 finally:
     log.close()
@@ -1074,21 +1086,20 @@ def _copy_produced(run_dir: Path, before: set[str], out_dir: Path) -> list[str]:
 
 
 def _evidence_file(path: Path) -> bool:
-    """True when a file is evidence worth listing as an output.
-
-    An **empty** log (a timeout before the child printed anything) carries
-    no diagnostic: it is removed and not listed, so the ``outputs`` of a
-    row never points at a 0-byte file.
-    """
+    """True when a file is worth listing as an output."""
     try:
-        if not path.exists():
-            return False
-        if path.stat().st_size == 0:
-            path.unlink()
-            return False
+        return path.exists() and path.stat().st_size > 0
     except OSError:
         return False
-    return True
+
+
+def _drop_empty_file(path: Path) -> None:
+    """Remove a 0-byte log so outputs never point at an empty artifact."""
+    try:
+        if path.exists() and path.stat().st_size == 0:
+            path.unlink()
+    except OSError:
+        pass
 
 
 def _safe_artifact_path(path: str) -> PurePosixPath | None:
@@ -1225,6 +1236,7 @@ def run_artifact(row: dict, layout: Layout, env_rows: dict[str, dict],
             out_log.write_text((res.get("stdout") or "") + (res.get("stderr") or ""))
             candidates = [out_log]
         for candidate in candidates:
+            _drop_empty_file(candidate)
             if _evidence_file(candidate):
                 outputs.append(f"{slug}/{candidate.name}")
         for rel_produced in _copy_produced(run_dir, before, env_dir / stem):
@@ -1285,7 +1297,9 @@ def main_with(argv: list[str] | None = None, root: Path | None = None) -> int:
     rows = load_jsonl(layout.triage)
     if args.repo:
         rows = [r for r in rows if r.get("repo") == args.repo]
-    done = already_run(layout.leaderboard)
+    existing = load_jsonl(layout.leaderboard)
+    logical = latest_by_key(existing)
+    done = {key for key, r in logical.items() if r.get("verdict") == "ok"}
     todo = [r for r in rows if artifact_key(r) not in done]
     unique: dict[str, dict] = {}
     for r in todo:
@@ -1310,7 +1324,7 @@ def main_with(argv: list[str] | None = None, root: Path | None = None) -> int:
                 row = fut.result()
             except Exception as exc:  # a worker bug must not kill the batch
                 row = _error_row(futures[fut], exc)
-            append_row(row, layout.leaderboard)
+            append_row(row, layout.leaderboard, logical)
             verdict = row.get("verdict", "error")
             counts[verdict] = counts.get(verdict, 0) + 1
             if verdict in ("error", "timeout"):

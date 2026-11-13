@@ -127,6 +127,7 @@ class TestHeadlineAndChains:
         out = tmp_path / "out" / "snapshot.json"
         rc = ws.main_with(["--root", str(tmp_path), "--out", str(out)])
         assert rc == 0 and json.loads(out.read_text())["generatedAt"]
+        assert (out.parent / "workspace.json").exists()
 
 
 class TestWorkspace:
@@ -313,7 +314,10 @@ class TestReviewRegressions:
             raise ValueError(value)
 
         snap = json.loads(out.read_text(), parse_constant=reject_constant)
-        run = snap["workspace"]["runs"][0]
+        assert "workspace" not in snap
+        ws_snap = json.loads((tmp_path / "workspace.json").read_text(),
+                             parse_constant=reject_constant)
+        run = ws_snap["runs"][0]
         assert run["netSharpe"] is None
         assert run["net_sharpe"] is None
         assert run["deflated_sharpe"] is None

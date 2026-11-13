@@ -46,9 +46,24 @@ RED_FLAGS = {"no_costs_mentioned", "in_sample_only", "cherry_picked_window",
 
 
 def load(path: Path) -> list[dict]:
+    """Read a JSONL file, skipping torn or non-object lines.
+
+    A stage that advertises resumability must not crash on a partial write.
+    """
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    rows: list[dict] = []
+    for line in path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
 
 
 def save(path: Path, rows: list[dict]) -> None:

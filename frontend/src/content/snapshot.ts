@@ -1,6 +1,8 @@
-/** Typed view of scripts/web_snapshot.py output. The loader never throws:
- * a missing or malformed snapshot degrades to a valid empty one so the
- * landing always renders (empty states, never fake content). */
+/** Typed view of scripts/web_snapshot.py's landing snapshot. The loader
+ * never throws: a missing or malformed snapshot degrades to a valid empty
+ * one so the landing always renders (empty states, never fake content).
+ * Workspace data lives in workspace.json and is imported lazily by the
+ * workspace screens (#39). */
 
 export interface Counts { articles: number; triaged: number; specs: number; backtests: number; external: number; }
 export interface Stage { index: string; name: string; description: string; artifact: string; doc: string; count?: number | null; }
@@ -32,10 +34,7 @@ export function loadSnapshot(raw: unknown): Snapshot {
     archive: Array.isArray(s.archive) ? s.archive : [],
     headline: s.headline ?? null,
     catalog: s.catalog ?? { series: 0, providers: [] },
-    // pass the workspace section through untouched — the workspace loader
-    // (content/workspace.ts) owns its contract
-    ...("workspace" in s ? { workspace: s.workspace } : {}),
-  } as Snapshot;
+  };
 }
 
 /** Vite static import of the generated JSON. Run scripts/web_snapshot.py first. */

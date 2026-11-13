@@ -39,6 +39,13 @@ class TestStripBody:
         assert triage.strip_body(page) == "just the body"
 
 
+class TestLoad:
+    def test_skips_torn_and_non_object_lines(self, tmp_path):
+        path = tmp_path / "triage.jsonl"
+        path.write_text('{"slug": "a"}\n\n{"torn\n[1, 2]\n{"slug": "b"}\n')
+        assert triage.load(path) == [{"slug": "a"}, {"slug": "b"}]
+
+
 class TestBuildPrompt:
     def test_contains_rubric_and_payload_fields(self):
         prompt = triage.build_prompt("RUBRIC", ROW, "article text")

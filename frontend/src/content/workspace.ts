@@ -1,6 +1,7 @@
-/** Typed view of snapshot.json's `workspace` section (scripts/web_snapshot.py
- * v2). Same degrade-to-empty contract as the landing loader. */
-import { snapshot } from "./snapshot";
+/** Typed view of workspace.json (scripts/web_snapshot.py). Same
+ * degrade-to-empty contract as the landing loader. Imported only by the
+ * lazily-loaded workspace screens, so the landing does not ship it (#39). */
+import generated from "./workspace.json";
 
 export interface Article { slug: string | null; title: string | null; source: string | null; url: string | null; posted: string | null; stage: string | null; blurb: string; triageScore: number | null; }
 export interface TriageRow { slug: string | null; title: string | null; url: string | null; claim: string; assetClass: string | null; score: number | null; redFlags: string[]; missing: string[]; reason: string; }
@@ -52,6 +53,4 @@ export function loadWorkspace(raw: unknown): Workspace {
   };
 }
 
-export const workspace: Workspace = loadWorkspace(
-  (snapshot as unknown as { workspace?: unknown }).workspace,
-);
+export const workspace: Workspace = loadWorkspace(generated);

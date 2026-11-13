@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""WEB SNAPSHOT — build frontend/src/content/snapshot.json from real artifacts.
+"""WEB SNAPSHOT — build the frontend's landing and workspace snapshots.
+
+Writes ``frontend/src/content/snapshot.json`` (landing data) and
+``frontend/src/content/workspace.json`` (workspace data) from real
+artifacts. Keeping them separate means the landing does not eagerly ship
+the workspace payload (#39).
 
 Pure readers over the pipeline's output artifacts (jsonl/yaml/md). Never
 executes the pipeline, never fabricates content: a fresh install produces a
@@ -375,12 +380,21 @@ def main_with(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=str(ROOT), help="repo root to read")
     ap.add_argument("--out", default=str(OUT))
+    ap.add_argument("--workspace-out", default=None,
+                    help="workspace payload (default: workspace.json beside --out)")
     args = ap.parse_args(argv)
     snap = build_snapshot(Path(args.root))
+    workspace = snap.pop("workspace", {})
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(snap, ensure_ascii=False, indent=1, allow_nan=False) + "\n")
+    ws_out = (Path(args.workspace_out) if args.workspace_out
+              else out.with_name("workspace.json"))
+    ws_out.parent.mkdir(parents=True, exist_ok=True)
+    ws_out.write_text(json.dumps(workspace, ensure_ascii=False, indent=1,
+                                 allow_nan=False) + "\n")
     print(f"snapshot -> {out} ({sum(snap['counts'].values())} artifacts)")
+    print(f"workspace -> {ws_out}")
     return 0
 
 
