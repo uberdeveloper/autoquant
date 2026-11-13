@@ -1255,6 +1255,29 @@ class TestResume:
         assert len(calls) == 1                  # the skip row did not block it
 
 
+class TestAppendRowConcurrency:
+    """#34: concurrent writers must not duplicate a logical verdict."""
+
+    def test_concurrent_identical_verdicts_append_one_row(self, tmp_path):
+        import threading
+
+        path = tmp_path / "leaderboard.jsonl"
+        row = {"artifact_key": "r|script|s.py", "verdict": "skip",
+               "reason": "NEEDS_HEAVY_ENV"}
+        barrier = threading.Barrier(16)
+
+        def write() -> None:
+            barrier.wait()
+            run_external.append_row(dict(row), path)
+
+        threads = [threading.Thread(target=write) for _ in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(path.read_text().splitlines()) == 1
+
+
 class TestLeaderboardRows:
     """D1: the leaderboard is one *logical* row per artifact."""
 

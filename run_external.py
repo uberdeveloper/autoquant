@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -196,8 +197,7 @@ def record_failure(row: dict, path: Path) -> None:
         raise
 
 
-def append_row(row: dict, path: Path,
-               seen: dict[str, dict] | None = None) -> None:
+def append_row(row: dict, path: Path) -> None:
     """Append one leaderboard row.
 
     The file stays **append-only** (other readers may rely on the history),
@@ -209,22 +209,26 @@ def append_row(row: dict, path: Path,
     verdict (skip -> error -> ok) IS appended: the history then shows how
     the artifact behaved.
 
-    ``seen`` is the caller's in-memory ``latest_by_key`` view, so a batch
-    does not re-read the whole file for every row.
+    The check-and-append runs under an exclusive ``flock`` on a sidecar
+    ``<name>.lock`` file, so concurrent runs cannot both see "no row yet"
+    and append duplicates.  The check reads the file itself (not a cached
+    view) so it sees rows appended by other processes.
     """
     key = row.get("artifact_key")
-    if key:
-        previous = (seen.get(key) if seen is not None
-                    else latest_by_key(load_jsonl(path)).get(key))
-        if (previous is not None
-                and previous.get("verdict") == row.get("verdict")
-                and previous.get("reason") == row.get("reason")):
-            return                      # the logical verdict is unchanged
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as fh:
-        fh.write(json.dumps(row) + "\n")
-    if key and seen is not None:
-        seen[key] = row
+    with open(path.with_name(path.name + ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if key:
+                previous = latest_by_key(load_jsonl(path)).get(key)
+                if (previous is not None
+                        and previous.get("verdict") == row.get("verdict")
+                        and previous.get("reason") == row.get("reason")):
+                    return              # the logical verdict is unchanged
+            with path.open("a") as fh:
+                fh.write(json.dumps(row) + "\n")
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 # ------------------------------------------------------------------- keys
@@ -1297,9 +1301,7 @@ def main_with(argv: list[str] | None = None, root: Path | None = None) -> int:
     rows = load_jsonl(layout.triage)
     if args.repo:
         rows = [r for r in rows if r.get("repo") == args.repo]
-    existing = load_jsonl(layout.leaderboard)
-    logical = latest_by_key(existing)
-    done = {key for key, r in logical.items() if r.get("verdict") == "ok"}
+    done = already_run(layout.leaderboard)
     todo = [r for r in rows if artifact_key(r) not in done]
     unique: dict[str, dict] = {}
     for r in todo:
@@ -1324,7 +1326,7 @@ def main_with(argv: list[str] | None = None, root: Path | None = None) -> int:
                 row = fut.result()
             except Exception as exc:  # a worker bug must not kill the batch
                 row = _error_row(futures[fut], exc)
-            append_row(row, layout.leaderboard, logical)
+            append_row(row, layout.leaderboard)
             verdict = row.get("verdict", "error")
             counts[verdict] = counts.get(verdict, 0) + 1
             if verdict in ("error", "timeout"):
