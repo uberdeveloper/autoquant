@@ -4,11 +4,18 @@ import Chat from "../src/ws/screens/Chat";
 import { listChats, loadChat, sendChat,
          type ChatSummary, type ChatOutcome, type ChatTurn } from "../src/lib/chatClient";
 
-vi.mock("../src/lib/chatClient", () => ({
-  sendChat: vi.fn(),
-  listChats: vi.fn(),
-  loadChat: vi.fn(),
-}));
+vi.mock("../src/lib/chatClient", async () => {
+  // spread the real module so value exports like BRIDGE_START survive;
+  // only the network functions are mocked
+  const actual = await vi.importActual<typeof import("../src/lib/chatClient")>(
+    "../src/lib/chatClient");
+  return {
+    ...actual,
+    sendChat: vi.fn(),
+    listChats: vi.fn(),
+    loadChat: vi.fn(),
+  };
+});
 
 const savedChat = (sessionId: string, title: string) => ({
   sessionId, title, updated: "2026-01-02T10:00:00+00:00", messageCount: 2,
@@ -204,5 +211,79 @@ describe("Chat history", () => {
     await waitFor(() => expect(
       screen.getByText(/Ask about your research/)).toBeInTheDocument());
     expect(screen.queryByText("old question")).not.toBeInTheDocument();
+  });
+
+  it("marks history as unavailable when the bridge can't be reached", async () => {
+    vi.mocked(listChats).mockResolvedValue(null);
+    render(<Chat />);
+    const toggle = await screen.findByRole(
+      "button", { name: /HISTORY \(—\)/ });
+    await userEvent.click(toggle);
+    expect(screen.getByText(/Can't load chats/)).toBeInTheDocument();
+    expect(screen.queryByText(/No saved conversations yet/))
+      .not.toBeInTheDocument();
+  });
+
+  it("falls back to the empty-state hint when a saved chat can't be loaded", async () => {
+    vi.mocked(listChats).mockResolvedValue([
+      savedChat("b", "newest question"),
+      savedChat("a", "older question"),
+    ]);
+    vi.mocked(loadChat).mockResolvedValueOnce([
+      { role: "user", text: "newest question" },
+      { role: "assistant", text: "newest answer" },
+    ]);
+    render(<Chat />);
+    await waitFor(() =>
+      expect(screen.getByText("newest answer")).toBeInTheDocument());
+    vi.mocked(loadChat).mockResolvedValue(null);
+    await userEvent.click(screen.getByRole("button", { name: /HISTORY \(2\)/ }));
+    await userEvent.click(screen.getByText("older question"));
+    // an unloadable transcript must not masquerade as a blank conversation
+    await waitFor(() => expect(
+      screen.queryByText("newest answer")).not.toBeInTheDocument());
+    expect(screen.getByText(/Ask about your research/)).toBeInTheDocument();
+  });
+
+  it("sends the next message fresh after a saved chat fails to load", async () => {
+    vi.mocked(listChats).mockResolvedValue([
+      savedChat("b", "newest question"),
+      savedChat("a", "older question"),
+    ]);
+    vi.mocked(loadChat).mockResolvedValueOnce([
+      { role: "user", text: "newest question" },
+      { role: "assistant", text: "newest answer" },
+    ]);
+    vi.mocked(sendChat).mockResolvedValue({
+      ok: true, reply: "PONG", sessionId: "c",
+    });
+    render(<Chat />);
+    await waitFor(() =>
+      expect(screen.getByText("newest answer")).toBeInTheDocument());
+    vi.mocked(loadChat).mockResolvedValue(null);
+    await userEvent.click(screen.getByRole("button", { name: /HISTORY \(2\)/ }));
+    await userEvent.click(screen.getByText("older question"));
+    await waitFor(() => expect(
+      screen.getByText(/Ask about your research/)).toBeInTheDocument());
+    // the failed switch must not leave the previous conversation's session
+    // id live: the next message would invisibly resume and extend it
+    await ask("next question");
+    await waitFor(() =>
+      expect(sendChat).toHaveBeenCalledWith("next question", null));
+  });
+
+  it("still fills the history list when NEW CHAT beats the initial restore", async () => {
+    let resolveList!: (v: ChatSummary[] | null) => void;
+    vi.mocked(listChats).mockImplementation(
+      () => new Promise((resolve) => { resolveList = resolve; }));
+    render(<Chat />);
+    await userEvent.click(screen.getByRole("button", { name: "NEW CHAT" }));
+    resolveList([savedChat("old", "Old chat")]);
+    // the history list is global: a restore that loses the conversation
+    // race must still populate it, not leave a false HISTORY (0)
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /HISTORY \(1\)/ }))
+        .toBeInTheDocument());
+    expect(loadChat).not.toHaveBeenCalled();
   });
 });

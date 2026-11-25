@@ -21,6 +21,10 @@ describe("sendChat", () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fail")));
     const out = await sendChat("hi", null);
     expect(out).toMatchObject({ ok: false, offline: true });
+    // a running bridge can still be blocked by the browser's local-network
+    // gate, so the message must cover that case too
+    expect((out as { ok: false; error: string }).error)
+      .toMatch(/local network/i);
   });
 
   it("surfaces the bridge's detail without the offline flag", async () => {
@@ -91,9 +95,9 @@ describe("listChats", () => {
     expect(await listChats()).toEqual([]);
   });
 
-  it("returns nothing when the bridge is offline", async () => {
+  it("returns null when the bridge is offline", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fail")));
-    expect(await listChats()).toEqual([]);
+    expect(await listChats()).toEqual(null);
   });
 });
 
@@ -133,10 +137,13 @@ describe("loadChat", () => {
     expect(await loadChat("a")).toEqual([{ role: "user", text: "kept" }]);
   });
 
-  it("returns nothing for an unknown or offline chat", async () => {
+  it("returns an empty transcript for a chat the bridge no longer has", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404 }));
     expect(await loadChat("gone")).toEqual([]);
+  });
+
+  it("returns null when the bridge is offline", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fail")));
-    expect(await loadChat("gone")).toEqual([]);
+    expect(await loadChat("gone")).toEqual(null);
   });
 });

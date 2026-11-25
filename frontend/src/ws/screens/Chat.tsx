@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Send } from "lucide-react";
-import { sendChat, listChats, loadChat, type ChatSummary } from "../../lib/chatClient";
+import { sendChat, listChats, loadChat, BRIDGE_START,
+         type ChatSummary } from "../../lib/chatClient";
 import { useDocumentTitle } from "../../lib/useDocumentTitle";
 
 interface Msg { role: "user" | "assistant"; text: string }
@@ -12,7 +13,8 @@ export default function Chat() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [history, setHistory] = useState<ChatSummary[]>([]);
+  // null = the bridge didn't answer, so history availability is unknown
+  const [history, setHistory] = useState<ChatSummary[] | null>([]);
   const [showHistory, setShowHistory] = useState(false);
   const [waiting, setWaiting] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
@@ -31,11 +33,14 @@ export default function Chat() {
   async function restoreLatest() {
     const gen = ++genRef.current;
     const chats = await listChats();
-    if (genRef.current !== gen) return;
+    // history is global, not per-conversation: a result that races a
+    // newer conversation switch still fills the list correctly, so it
+    // lands above the generation guard (which protects messages/sessionId)
     setHistory(chats);
-    if (chats.length === 0) return;
-    const saved = await loadChat(chats[0].sessionId);
     if (genRef.current !== gen) return;
+    if (!chats || chats.length === 0) return;
+    const saved = await loadChat(chats[0].sessionId);
+    if (genRef.current !== gen || saved === null) return;
     setMessages(saved);
     setSessionId(chats[0].sessionId);
   }
@@ -44,6 +49,15 @@ export default function Chat() {
     const gen = ++genRef.current;
     const saved = await loadChat(id);
     if (genRef.current !== gen) return;
+    // an unloadable transcript must not replace the view with a blank chat;
+    // dropping back to the empty state makes the failed bridge visible —
+    // and the old session id must not survive: the next message would
+    // invisibly resume the conversation the user just left
+    if (saved === null) {
+      setMessages([]);
+      setSessionId(null);
+      return;
+    }
     setMessages(saved);
     setSessionId(id);
     setShowHistory(false);
@@ -95,7 +109,7 @@ export default function Chat() {
           aria-expanded={showHistory}
           className="text-dim transition-colors hover:text-ink"
         >
-          HISTORY ({history.length})
+          HISTORY ({history === null ? "—" : history.length})
         </button>
         <button
           type="button"
@@ -108,7 +122,12 @@ export default function Chat() {
 
       {showHistory && (
         <ul className="mt-2 max-h-48 overflow-y-auto border border-line bg-surface/30">
-          {history.length === 0 ? (
+          {history === null ? (
+            <li className="px-4 py-2 font-mono text-[11px] text-dim">
+              Can't load chats — is the bridge running?{" "}
+              <code className="text-ink">{BRIDGE_START}</code>
+            </li>
+          ) : history.length === 0 ? (
             <li className="px-4 py-2 font-mono text-[11px] text-dim">
               No saved conversations yet.
             </li>
@@ -138,7 +157,7 @@ export default function Chat() {
             Ask about your research: counts, runs, failures, specs, catalog…
             <div className="mt-3 font-mono text-[11px]">
               requires the local bridge:{" "}
-              <code className="text-ink">uv run python local_bridge.py</code>
+              <code className="text-ink">{BRIDGE_START}</code>
             </div>
           </div>
         ) : (
