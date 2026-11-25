@@ -64,6 +64,11 @@ app.add_middleware(
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
+    # Chrome sends a Private Network Access preflight when the deployed
+    # HTTPS app fetches this loopback server; without this it blocks every
+    # request (and Safari/Firefox ignore it). Still gated by the origin
+    # allowlist above.
+    allow_private_network=True,
 )
 
 

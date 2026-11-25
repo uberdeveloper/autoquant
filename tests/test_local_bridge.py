@@ -527,3 +527,50 @@ def test_malformed_workspace_entries_do_not_crash(monkeypatch, tmp_path):
         {"runs": ["oops"], "failed": ["x"], "specs": [1]}))
     monkeypatch.setattr(ws, "DIGEST_PATH", tmp_path / "snapshot.json")
     assert ws.load_digest()
+
+
+class TestCorsPreflight:
+    """Chrome sends a Private Network Access preflight when the deployed
+    HTTPS app fetches the loopback bridge; if it is not answered, every
+    chat request from https://autoquant-blush.vercel.app is blocked."""
+
+    DEPLOYED = "https://autoquant-blush.vercel.app"
+
+    def preflight(self, ws, private_network: bool) -> tuple[int, dict]:
+        headers = [
+            # real Chrome preflights carry Host, so the request crosses the
+            # loopback-host gate before CORSMiddleware answers it
+            (b"host", b"127.0.0.1:8787"),
+            (b"origin", self.DEPLOYED.encode()),
+            (b"access-control-request-method", b"POST"),
+            (b"access-control-request-headers", b"content-type"),
+        ]
+        if private_network:
+            headers.append(
+                (b"access-control-request-private-network", b"true"))
+        messages: list = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            messages.append(message)
+
+        scope = {"type": "http", "method": "OPTIONS", "path": "/api/chat",
+                 "headers": headers, "query_string": b""}
+        asyncio.run(ws.app(scope, receive, send))
+        start = next(m for m in messages
+                     if m["type"] == "http.response.start")
+        heads = {k.decode().lower(): v.decode() for k, v in start["headers"]}
+        return start["status"], heads
+
+    def test_private_network_preflight_from_the_deployed_origin(self):
+        status, headers = self.preflight(load_module(), True)
+        assert status == 200
+        assert headers["access-control-allow-origin"] == self.DEPLOYED
+        assert headers["access-control-allow-private-network"] == "true"
+
+    def test_plain_preflight_still_allows_the_deployed_origin(self):
+        status, headers = self.preflight(load_module(), False)
+        assert status == 200
+        assert headers["access-control-allow-origin"] == self.DEPLOYED
